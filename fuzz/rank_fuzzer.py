@@ -1,33 +1,29 @@
-"""Atheris harness scaffolded by ClusterFuzz (AST fallback)."""
+"""Fuzz ranking and the next-draft suggestion."""
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import atheris
 
 _REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO / 'src'))
+sys.path.insert(0, str(_REPO / "src"))
+sys.path.insert(0, str(_REPO / "fuzz"))
 
-from deadinternet.domain.rank import cell_size, below_sample_floor, suggest, assert_no_render_side_effect  # noqa: E402
+from corpus import EXPECTED, catalog_for, experiment_from  # noqa: E402
+from deadinternet.domain.experiment import Status  # noqa: E402
+from deadinternet.domain.rank import assert_no_render_side_effect, below_sample_floor, cell_size, suggest  # noqa: E402
 
 
 def TestOneInput(data: bytes) -> None:
     fdp = atheris.FuzzedDataProvider(data)
+    row = replace(experiment_from(fdp), status=Status.complete)
+    cell_size([row], row)
+    below_sample_floor(fdp.ConsumeIntInRange(0, 6))
+    assert_no_render_side_effect()
     try:
-        cell_size(fdp.ConsumeUnicodeNoSurrogates(min(fdp.RemainingBytes(), 4096)), fdp.ConsumeUnicodeNoSurrogates(min(fdp.RemainingBytes(), 4096)))
-    except Exception:
-        pass
-    try:
-        below_sample_floor(fdp.ConsumeIntInRange(-10**6, 10**6), fdp.ConsumeIntInRange(-10**6, 10**6))
-    except Exception:
-        pass
-    try:
-        suggest(fdp.ConsumeUnicodeNoSurrogates(min(fdp.RemainingBytes(), 4096)), fdp.ConsumeUnicodeNoSurrogates(min(fdp.RemainingBytes(), 4096)))
-    except Exception:
-        pass
-    try:
-        assert_no_render_side_effect()
-    except Exception:
-        pass
+        suggest([row], catalog_for(row))
+    except EXPECTED:
+        return
 
 
 def main() -> None:
