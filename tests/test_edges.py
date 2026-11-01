@@ -171,10 +171,11 @@ def test_live_publisher_without_a_token_packs_a_manual_post():
 def test_main_starts_the_local_server(monkeypatch):
     seen = {}
 
-    def fake_create_app(store, renderer, publisher):
+    def fake_create_app(store, renderer, publisher, proposer):
         seen["store"] = store
         seen["renderer"] = renderer
         seen["publisher"] = publisher
+        seen["proposer"] = proposer
         return "app"
 
     def fake_run(app, host, port):
@@ -195,3 +196,4 @@ def test_main_starts_the_local_server(monkeypatch):
     assert seen["store"] == "data/deadinternet.sqlite"
     assert type(seen["renderer"]).__name__ == "LiveRenderer"
     assert type(seen["publisher"]).__name__ == "LivePublisher"
+    assert type(seen["proposer"]).__name__ == "RepairProposer"

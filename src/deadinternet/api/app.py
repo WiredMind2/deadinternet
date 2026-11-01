@@ -30,12 +30,14 @@ from deadinternet.domain.experiment import (
     request_render,
 )
 from deadinternet.domain.proposal import (
+    Catalog,
     DraftSpec,
     ProposalRejected,
     _money_from,
     _style_from,
     starter_grid,
 )
+from deadinternet.propose.agent import ProposerFailed, ProposerUnavailable
 from deadinternet.domain.rank import below_sample_floor, cell_size, suggest
 from deadinternet.metrics.pull import record_snapshot
 from deadinternet.track.redirect import hit
@@ -55,6 +57,11 @@ class Publisher(Protocol):
         token: str | None = None,
     ) -> Any:
         """Return an object with .publication and optional .manual_pack."""
+
+
+class Proposer(Protocol):
+    def propose(self, experiments: list[Experiment], catalog: Catalog) -> list[DraftSpec]:
+        """Return the next drafts. Do not persist them."""
 
 
 @dataclass(frozen=True)
@@ -187,7 +194,12 @@ def _share_sqlite(store) -> None:
     store._conn = shared
 
 
-def create_app(store, renderer: Renderer | None = None, publisher: Publisher | None = None) -> FastAPI:
+def create_app(
+    store,
+    renderer: Renderer | None = None,
+    publisher: Publisher | None = None,
+    proposer: Proposer | None = None,
+) -> FastAPI:
     store = _ThreadSafeStore(store)
     renderer = renderer or PlaceholderRenderer()
     publisher = publisher or PlaceholderPublisher()
@@ -209,6 +221,14 @@ def create_app(store, renderer: Renderer | None = None, publisher: Publisher | N
     @app.exception_handler(ProposalRejected)
     def proposal_rejected(_request, exc: ProposalRejected):
         return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.exception_handler(ProposerUnavailable)
+    def proposer_unavailable(_request, exc: ProposerUnavailable):
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    @app.exception_handler(ProposerFailed)
+    def proposer_failed(_request, exc: ProposerFailed):
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
 
     @app.get("/experiments")
     def get_experiments():
@@ -322,7 +342,10 @@ def create_app(store, renderer: Renderer | None = None, publisher: Publisher | N
     def suggest_next():
         experiments = list(store.list_experiments())
         catalog = store.catalog()
-        drafts = suggest(experiments, catalog)
+        if proposer is None:
+            drafts = suggest(experiments, catalog)
+        else:
+            drafts = proposer.propose(experiments, catalog)
         return [_draft_json(draft) for draft in drafts]
 
     @app.get("/r/{code}")
