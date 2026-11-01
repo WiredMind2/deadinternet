@@ -962,7 +962,7 @@ function Proposals({ drafts, setDrafts, onAccepted }) {
   return (
     <>
       <Banner>{error}</Banner>
-      <p>Suggest reads completed videos and lists the next factor changes.</p>
+      <p>The model writes the next draft from completed videos.</p>
       <div className="actions">
         <button type="button" onClick={suggest} disabled={busy === "suggest"}>
           Suggest
