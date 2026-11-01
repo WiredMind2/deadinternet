@@ -13,6 +13,8 @@ export default defineConfig({
       "/suggest": { target: api },
       "/publications": { target: api },
       "/catalog": { target: api },
+      "/themes": { target: api },
+      "/niches": { target: api },
       "/r": { target: api },
     },
   },

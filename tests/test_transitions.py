@@ -3,9 +3,11 @@ import pytest
 from deadinternet.domain.experiment import (
     Affiliate,
     AvatarStyle,
+    Beat,
     Experiment,
     FacelessStyle,
     IneligibleLength,
+    InvalidBoard,
     InvalidTransition,
     Look,
     Platform,
@@ -13,9 +15,12 @@ from deadinternet.domain.experiment import (
     RenderCapReached,
     Status,
     approve,
+    approve_board,
     mark_posted,
     mark_rendered,
     request_render,
+    revise_board,
+    script_from_beats,
 )
 
 
@@ -51,8 +56,41 @@ def test_mark_posted_on_in_review_raises():
         mark_posted(_row(status=Status.in_review))
 
 
+def test_draft_cannot_render():
+    with pytest.raises(InvalidTransition):
+        request_render(_row(), renders_started_today=0)
+
+
+def test_board_approval_requires_a_spoken_line_on_every_beat():
+    with pytest.raises(InvalidBoard):
+        approve_board(_row(), beats=(), board_hash="abc")
+    with pytest.raises(InvalidBoard):
+        approve_board(_row(), beats=(Beat(spoken="  "),), board_hash="abc")
+
+
+def test_spoken_lines_join_in_order():
+    beats = (
+        Beat(spoken="Open on the result.", on_screen="Result", visual_note="finished dish"),
+        Beat(spoken="Show the steps.", on_screen="", visual_note=""),
+    )
+    assert script_from_beats(beats) == "Open on the result.\nShow the steps."
+    approved = approve_board(_row(), beats=beats, board_hash="hash-1")
+    assert approved.status is Status.board_approved
+    assert approved.script == "Open on the result.\nShow the steps."
+    assert approved.board_hash == "hash-1"
+    revised = revise_board(approved, beats[:1])
+    assert revised.status is Status.draft
+    assert revised.board_hash is None
+    assert revised.script == "Open on the result."
+
+
 def test_render_then_approve_then_post():
-    rendering = request_render(_row(), renders_started_today=0)
+    approved_board = approve_board(
+        _row(),
+        beats=(Beat(spoken="Here is the spoken script."),),
+        board_hash="hash-1",
+    )
+    rendering = request_render(approved_board, renders_started_today=0)
     assert rendering.status is Status.rendering
     ready = mark_rendered(rendering, file_path="data/videos/exp-1.mp4")
     assert ready.status is Status.in_review

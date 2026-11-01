@@ -1,9 +1,11 @@
 from deadinternet.domain.experiment import (
     AvatarStyle,
+    Beat,
     Experiment,
     FacelessStyle,
     Look,
     Status,
+    script_from_beats,
     style_key,
 )
 from deadinternet.domain.proposal import Catalog, DraftSpec, FactorDiff, ProposalRejected, parse_proposal
@@ -37,6 +39,7 @@ def suggest(completed: list[Experiment], catalog: Catalog) -> list[DraftSpec]:
         FactorDiff("style", style_key(parent.style)[0], style_key(next_style)[0]),
         FactorDiff("hook_id", parent.hook_id, next_hook),
     )
+    beats = (Beat(spoken=f"Follow-up script distinct from {parent.id}.", on_screen="", visual_note=""),)
     draft = DraftSpec(
         parent_ids=(parent.id,),
         factor_diffs=diffs,
@@ -45,9 +48,10 @@ def suggest(completed: list[Experiment], catalog: Catalog) -> list[DraftSpec]:
         money=parent.money,
         hook_id=next_hook,
         hypothesis=f"Change style and hook after {parent.id}",
-        script=f"Follow-up script distinct from {parent.id}.",
+        script=script_from_beats(beats),
         caption=parent.caption,
         length_sec=parent.length_sec,
+        beats=beats,
     )
     return parse_proposal([_to_raw(draft)], catalog)
 
@@ -106,6 +110,14 @@ def _to_raw(draft: DraftSpec) -> dict:
         "script": draft.script,
         "caption": draft.caption,
         "length_sec": draft.length_sec,
+        "beats": [
+            {
+                "spoken": beat.spoken,
+                "on_screen": beat.on_screen,
+                "visual_note": beat.visual_note,
+            }
+            for beat in draft.beats
+        ],
     }
 
 

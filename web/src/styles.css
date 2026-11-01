@@ -76,13 +76,19 @@ form .actions button[type="submit"],
 }
 
 input,
-select {
+select,
+textarea {
   background: #0c0e0a;
   border: 1px solid var(--line);
   border-radius: 2px;
   padding: 0.45rem 0.55rem;
   min-width: 0;
   width: 100%;
+}
+
+textarea {
+  min-height: 4.5rem;
+  resize: vertical;
 }
 
 :focus-visible {

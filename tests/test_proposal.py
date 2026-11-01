@@ -8,7 +8,7 @@ from deadinternet.domain.experiment import (
     Status,
 )
 from deadinternet.domain.proposal import Catalog, ProposalRejected, parse_proposal, starter_grid
-from deadinternet.domain.rank import below_sample_floor, suggest
+from deadinternet.domain.rank import below_sample_floor, cell_size, suggest
 
 
 def _catalog(**overrides) -> Catalog:
@@ -95,6 +95,25 @@ def test_suggest_changes_more_than_one_factor_and_does_not_render():
     assert below_sample_floor(1)
 
 
+def test_two_niches_score_as_different_cells():
+    first = _parent()
+    second = Experiment(
+        id="exp-other",
+        niche_id="niche-2",
+        hypothesis=first.hypothesis,
+        hook_id=first.hook_id,
+        script=first.script,
+        caption=first.caption,
+        style=first.style,
+        money=first.money,
+        status=Status.complete,
+        length_sec=first.length_sec,
+    )
+    rows = [first, second]
+    assert cell_size(rows, first) == 1
+    assert cell_size(rows, second) == 1
+
+
 def test_starter_grid_creates_two_drafts_per_niche_without_rendering():
     money = Affiliate(tracking_code="abc", merchant="acme")
     drafts = starter_grid(["niche-1", "niche-2"], money, "question", "voice-1", "presenter-1")
@@ -103,3 +122,5 @@ def test_starter_grid_creates_two_drafts_per_niche_without_rendering():
     assert kinds.count("faceless") == 2
     assert kinds.count("avatar") == 2
     assert all(draft.factor_diffs == () for draft in drafts)
+    assert all(len(draft.beats) == 1 for draft in drafts)
+    assert drafts[0].script == drafts[0].beats[0].spoken

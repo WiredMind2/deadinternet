@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const SCREENS = ["Board", "Review", "Post", "Results", "Proposals", "Catalog"];
 const PLATFORMS = ["tiktok", "instagram", "youtube"];
 const STATUSES = [
   "draft",
+  "board_approved",
   "rendering",
   "render_failed",
   "in_review",
@@ -134,6 +135,7 @@ function idList(value) {
 function normalizeCatalog(data) {
   const source = data?.catalog && typeof data.catalog === "object" ? data.catalog : data || {};
   return {
+    themes: idList(source.theme_ids || source.themes),
     niches: idList(source.niche_ids || source.niches),
     voices: idList(source.voice_ids || source.voices),
     presenters: idList(source.presenter_ids || source.presenters),
@@ -186,6 +188,7 @@ function draftPayload(draft) {
     money: draft.money,
     ...(draft.language ? { language: draft.language } : {}),
     ...(draft.proposal_id ? { proposal_id: draft.proposal_id } : {}),
+    ...(Array.isArray(draft.beats) ? { beats: draft.beats } : {}),
   };
 }
 
@@ -218,6 +221,7 @@ function experimentFacts(experiment, { includeCopy = true } = {}) {
   const rows = [
     { label: "id", value: show(experiment.id) },
     { label: "status", value: show(experiment.status) },
+    { label: "theme_id", value: show(experiment.theme_id) },
     { label: "niche_id", value: show(experiment.niche_id) },
     { label: "hook_id", value: show(experiment.hook_id) },
     { label: "hypothesis", value: show(experiment.hypothesis), wide: true },
@@ -271,7 +275,190 @@ function Banner({ tone = "error", children }) {
   );
 }
 
-function Board({ experiments, selectedId, onSelect, onRefresh, error }) {
+const EDITABLE_BOARD = new Set(["draft", "board_approved", "render_failed"]);
+
+function StoryboardEditor({ experiment, onChanged }) {
+  const keyRef = useRef(1);
+  const [beats, setBeats] = useState([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+
+  function keyed(rows) {
+    return rows.map((beat) => ({
+      spoken: beat.spoken || "",
+      on_screen: beat.on_screen || "",
+      visual_note: beat.visual_note || "",
+      key: `beat-${keyRef.current++}`,
+    }));
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    setError("");
+    api(`/experiments/${encodeURIComponent(experiment.id)}/storyboard`)
+      .then((data) => {
+        if (!cancelled) setBeats(keyed(Array.isArray(data.beats) ? data.beats : []));
+      })
+      .catch((err) => {
+        if (!cancelled) setError(errorMessage(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [experiment.id]);
+
+  function updateBeat(key, field, value) {
+    setBeats((current) =>
+      current.map((beat) => (beat.key === key ? { ...beat, [field]: value } : beat)),
+    );
+  }
+
+  function payload() {
+    return beats.map((beat) => ({
+      spoken: beat.spoken,
+      on_screen: beat.on_screen,
+      visual_note: beat.visual_note,
+    }));
+  }
+
+  async function save(event) {
+    event.preventDefault();
+    setBusy("save");
+    setError("");
+    try {
+      await api(`/experiments/${encodeURIComponent(experiment.id)}/storyboard`, {
+        method: "PUT",
+        body: JSON.stringify({ beats: payload() }),
+      });
+      await onChanged(`Saved the storyboard for ${experiment.id}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function approveBoard() {
+    setBusy("approve");
+    setError("");
+    try {
+      await api(`/experiments/${encodeURIComponent(experiment.id)}/storyboard`, {
+        method: "PUT",
+        body: JSON.stringify({ beats: payload() }),
+      });
+      await api(`/experiments/${encodeURIComponent(experiment.id)}/approve-board`, {
+        method: "POST",
+      });
+      await onChanged(`Approved the storyboard for ${experiment.id}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function renderVideo() {
+    setBusy("render");
+    setError("");
+    try {
+      await api(`/experiments/${encodeURIComponent(experiment.id)}/render`, { method: "POST" });
+      await onChanged(`Rendered ${experiment.id}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  if (!EDITABLE_BOARD.has(experiment.status)) return null;
+
+  return (
+    <form onSubmit={save}>
+      <fieldset>
+        <legend>Storyboard</legend>
+        <Banner>{error}</Banner>
+        {beats.length === 0 ? <p>Add a beat before approving this board.</p> : null}
+        <ol className="stack">
+          {beats.map((beat, index) => (
+            <li key={beat.key}>
+              <fieldset>
+                <legend>Beat {index + 1}</legend>
+                <div className="filter">
+                  <label htmlFor={`${beat.key}-spoken`}>Spoken line</label>
+                  <textarea
+                    id={`${beat.key}-spoken`}
+                    name="spoken"
+                    value={beat.spoken}
+                    onChange={(event) => updateBeat(beat.key, "spoken", event.target.value)}
+                  />
+                </div>
+                <div className="filter">
+                  <label htmlFor={`${beat.key}-screen`}>On-screen text</label>
+                  <input
+                    id={`${beat.key}-screen`}
+                    name="on_screen"
+                    type="text"
+                    value={beat.on_screen}
+                    onChange={(event) => updateBeat(beat.key, "on_screen", event.target.value)}
+                  />
+                </div>
+                <div className="filter">
+                  <label htmlFor={`${beat.key}-visual`}>Visual note</label>
+                  <input
+                    id={`${beat.key}-visual`}
+                    name="visual_note"
+                    type="text"
+                    value={beat.visual_note}
+                    onChange={(event) => updateBeat(beat.key, "visual_note", event.target.value)}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="danger"
+                  onClick={() => setBeats((current) => current.filter((item) => item.key !== beat.key))}
+                >
+                  Remove beat {index + 1}
+                </button>
+              </fieldset>
+            </li>
+          ))}
+        </ol>
+        <div className="actions">
+          <button
+            type="button"
+            onClick={() =>
+              setBeats((current) => [
+                ...current,
+                { spoken: "", on_screen: "", visual_note: "", key: `beat-${keyRef.current++}` },
+              ])
+            }
+          >
+            Add beat
+          </button>
+          <button type="submit" disabled={Boolean(busy)}>
+            Save storyboard
+          </button>
+          <button
+            type="button"
+            onClick={approveBoard}
+            disabled={Boolean(busy) || experiment.status !== "draft"}
+          >
+            Approve board
+          </button>
+          <button
+            type="button"
+            onClick={renderVideo}
+            disabled={Boolean(busy) || experiment.status !== "board_approved"}
+          >
+            Render
+          </button>
+        </div>
+      </fieldset>
+    </form>
+  );
+}
+
+function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error }) {
   const [niche, setNiche] = useState("");
   const [style, setStyle] = useState("");
   const [money, setMoney] = useState("");
@@ -387,6 +574,7 @@ function Board({ experiments, selectedId, onSelect, onRefresh, error }) {
         <section className="panel">
           <h2>Selected</h2>
           {selected ? <Facts rows={experimentFacts(selected)} /> : <p>Select a row.</p>}
+          {selected ? <StoryboardEditor experiment={selected} onChanged={onChanged} /> : null}
         </section>
       </div>
     </>
@@ -825,6 +1013,13 @@ function Proposals({ drafts, setDrafts, onAccepted }) {
                   { label: "money.kind", value: show(moneyKind(draft)) },
                   { label: "hypothesis", value: show(draft.hypothesis), wide: true },
                   { label: "script", value: show(draft.script), wide: true },
+                  {
+                    label: "beats",
+                    value: Array.isArray(draft.beats)
+                      ? draft.beats.map((beat) => beat.spoken).filter(Boolean).join(" / ")
+                      : "—",
+                    wide: true,
+                  },
                   { label: "caption", value: show(draft.caption), wide: true },
                 ]}
               />
@@ -837,8 +1032,9 @@ function Proposals({ drafts, setDrafts, onAccepted }) {
 }
 
 function Catalog({ onBuilt }) {
-  const [hints, setHints] = useState({ niches: [], voices: [], presenters: [], hooks: [] });
+  const [hints, setHints] = useState({ themes: [], niches: [], voices: [], presenters: [], hooks: [] });
   const [catalogMissing, setCatalogMissing] = useState(false);
+  const [themeId, setThemeId] = useState("");
   const [nicheIds, setNicheIds] = useState("");
   const [voiceId, setVoiceId] = useState("");
   const [presenterId, setPresenterId] = useState("");
@@ -852,25 +1048,22 @@ function Catalog({ onBuilt }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
 
+  async function loadCatalog() {
+    try {
+      const data = await api("/catalog");
+      setHints(normalizeCatalog(data));
+      setCatalogMissing(false);
+    } catch (err) {
+      if (err.status === 404) {
+        setCatalogMissing(true);
+        return;
+      }
+      setError(errorMessage(err));
+    }
+  }
+
   useEffect(() => {
-    let cancelled = false;
-    api("/catalog")
-      .then((data) => {
-        if (cancelled) return;
-        setHints(normalizeCatalog(data));
-        setCatalogMissing(false);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        if (err.status === 404) {
-          setCatalogMissing(true);
-          return;
-        }
-        setError(errorMessage(err));
-      });
-    return () => {
-      cancelled = true;
-    };
+    loadCatalog();
   }, []);
 
   function money() {
@@ -895,6 +1088,53 @@ function Catalog({ onBuilt }) {
       const list = unwrapList(data);
       setCreated(list);
       await onBuilt(`Starter grid returned ${list.length}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function addTheme() {
+    const id = themeId.trim();
+    if (!id) {
+      setError("Enter a theme id.");
+      return;
+    }
+    setBusy("theme");
+    setError("");
+    try {
+      await api("/themes", {
+        method: "POST",
+        body: JSON.stringify({ id, name: id, language: "en" }),
+      });
+      await loadCatalog();
+      await onBuilt(`Saved theme ${id}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function addNiche() {
+    const theme = themeId.trim();
+    const niches = splitIds(nicheIds);
+    if (!theme || niches.length === 0) {
+      setError("Enter a theme id and a niche id.");
+      return;
+    }
+    setBusy("niche");
+    setError("");
+    try {
+      for (const nicheId of niches) {
+        await api("/niches", {
+          method: "POST",
+          body: JSON.stringify({ id: nicheId, theme_id: theme, name: nicheId }),
+        });
+      }
+      await loadCatalog();
+      await onBuilt(`Saved ${niches.length} niche${niches.length === 1 ? "" : "s"}.`);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -950,6 +1190,25 @@ function Catalog({ onBuilt }) {
         <fieldset>
           <legend>Starter</legend>
           <div className="form-grid">
+            <div className="filter">
+              <label htmlFor="theme-id">Theme id</label>
+              <input
+                id="theme-id"
+                type="text"
+                value={themeId}
+                onChange={(event) => setThemeId(event.target.value)}
+                list="catalog-themes"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
+                placeholder="history"
+              />
+              <datalist id="catalog-themes">
+                {hints.themes.map((id) => (
+                  <option key={id} value={id} />
+                ))}
+              </datalist>
+            </div>
             <div className="filter">
               <label htmlFor="niche-id">Niche id</label>
               <input
@@ -1084,14 +1343,18 @@ function Catalog({ onBuilt }) {
           </div>
         </fieldset>
         <div className="actions">
+          <button type="button" onClick={addTheme} disabled={Boolean(busy)}>
+            Add theme
+          </button>
+          <button type="button" onClick={addNiche} disabled={Boolean(busy)}>
+            Add niche
+          </button>
           <button type="submit" disabled={busy === "starter"}>
             Build starter grid
           </button>
-          {catalogMissing ? (
-            <button type="button" onClick={saveExperimentDraft} disabled={busy === "draft"}>
-              Save experiment draft
-            </button>
-          ) : null}
+          <button type="button" onClick={saveExperimentDraft} disabled={busy === "draft"}>
+            Save experiment draft
+          </button>
         </div>
       </form>
       {created.length > 0 ? (
@@ -1174,6 +1437,10 @@ export default function App() {
             selectedId={selectedId}
             onSelect={setSelectedId}
             onRefresh={loadExperiments}
+            onChanged={async (message) => {
+              setNotice(message);
+              await loadExperiments();
+            }}
             error={loadError}
           />
         ) : null}

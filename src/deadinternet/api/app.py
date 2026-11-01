@@ -13,8 +13,10 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from deadinternet.domain.experiment import (
+    Beat,
     Experiment,
     IneligibleLength,
+    InvalidBoard,
     InvalidTransition,
     Platform,
     Publication,
@@ -23,11 +25,21 @@ from deadinternet.domain.experiment import (
     Status,
     Style,
     approve,
+    approve_board,
     complete,
     mark_posted,
     mark_rendered,
     reject,
     request_render,
+    revise_board,
+    script_from_beats,
+)
+from deadinternet.storyboard import (
+    UnsafeId,
+    check_segment,
+    read_storyboard,
+    storyboard_path,
+    write_storyboard,
 )
 from deadinternet.domain.proposal import (
     DraftSpec,
@@ -109,7 +121,8 @@ class ExperimentIn(BaseModel):
     niche_id: str
     hypothesis: str
     hook_id: str
-    script: str
+    script: str | None = None
+    beats: list[dict[str, Any]] | None = None
     caption: str
     style: dict[str, Any]
     money: dict[str, Any]
@@ -117,6 +130,22 @@ class ExperimentIn(BaseModel):
     proposal_id: str | None = None
     language: str = "en"
     measurement_window_days: int = 7
+
+
+class ThemeIn(BaseModel):
+    id: str
+    name: str
+    language: str = "en"
+
+
+class NicheIn(BaseModel):
+    id: str
+    theme_id: str
+    name: str
+
+
+class StoryboardIn(BaseModel):
+    beats: list[dict[str, Any]]
 
 
 class ApproveIn(BaseModel):
@@ -210,50 +239,144 @@ def create_app(store, renderer: Renderer | None = None, publisher: Publisher | N
     def proposal_rejected(_request, exc: ProposalRejected):
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    @app.exception_handler(InvalidBoard)
+    def invalid_board(_request, exc: InvalidBoard):
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.get("/catalog")
+    def get_catalog():
+        catalog = store.catalog()
+        return {
+            "themes": [
+                {"id": theme.id, "name": theme.name, "language": theme.language}
+                for theme in store.list_themes()
+            ],
+            "niches": [
+                {"id": niche.id, "theme_id": niche.theme_id, "name": niche.name}
+                for niche in store.list_niches()
+            ],
+            "theme_ids": sorted(catalog.theme_ids),
+            "niche_ids": sorted(catalog.niche_ids),
+            "presenter_ids": sorted(catalog.presenter_ids),
+            "voice_ids": sorted(catalog.voice_ids),
+            "hook_ids": sorted(catalog.hook_ids),
+            "offer_ids": sorted(catalog.offer_ids),
+        }
+
+    @app.post("/themes")
+    def create_theme(body: ThemeIn):
+        try:
+            check_segment(body.id)
+        except UnsafeId as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store.upsert_theme(body.id, body.name, body.language)
+        theme = store.get_theme(body.id)
+        return {"id": theme.id, "name": theme.name, "language": theme.language}
+
+    @app.post("/niches")
+    def create_niche(body: NicheIn):
+        try:
+            check_segment(body.id)
+            check_segment(body.theme_id)
+        except UnsafeId as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if store.get_theme(body.theme_id) is None:
+            raise HTTPException(status_code=422, detail=f"unknown theme {body.theme_id}")
+        store.upsert_niche(body.id, body.theme_id, body.name)
+        niche = store.get_niche(body.id)
+        return {"id": niche.id, "theme_id": niche.theme_id, "name": niche.name}
+
     @app.get("/experiments")
     def get_experiments():
-        return [_experiment_json(row) for row in store.list_experiments()]
+        return [_experiment_json(store, row) for row in store.list_experiments()]
 
     @app.post("/experiments")
     def create_experiment(body: ExperimentIn):
+        raw = body.model_dump()
         try:
-            experiment = _experiment_from_body(body.model_dump())
+            beats = _beats_from_payload(raw)
+            experiment = _experiment_from_body(raw, beats)
+            niche = _require_niche(store, experiment.niche_id)
+            check_segment(experiment.id)
+        except (KeyError, ValueError, TypeError, UnsafeId) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
+        write_storyboard(path, beats)
+        store.insert_experiment(experiment)
+        return _experiment_json(store, experiment)
+
+    @app.get("/experiments/{experiment_id}/storyboard")
+    def get_storyboard(experiment_id: str):
+        _require_experiment(store, experiment_id)
+        beats, _digest = _load_board(store, experiment_id)
+        return {"beats": [_beat_json(beat) for beat in beats]}
+
+    @app.put("/experiments/{experiment_id}/storyboard")
+    def put_storyboard(experiment_id: str, body: StoryboardIn):
+        experiment = _require_experiment(store, experiment_id)
+        if experiment.status not in {Status.draft, Status.board_approved, Status.render_failed}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{experiment.status.value} cannot revise_board",
+            )
+        try:
+            beats = _beats_from_payload({"beats": body.beats})
         except (KeyError, ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        store.insert_experiment(experiment)
-        return _experiment_json(experiment)
+        niche = _require_niche(store, experiment.niche_id)
+        path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
+        write_storyboard(path, beats)
+        store.save_experiment(revise_board(experiment, beats))
+        return _experiment_json(store, store.get_experiment(experiment.id))
+
+    @app.post("/experiments/{experiment_id}/approve-board")
+    def approve_storyboard(experiment_id: str):
+        experiment = _require_experiment(store, experiment_id)
+        beats, digest = _load_board(store, experiment_id)
+        approved = approve_board(experiment, beats, digest)
+        store.save_experiment(approved)
+        return _experiment_json(store, approved)
 
     @app.post("/experiments/{experiment_id}/render")
     def render_experiment(experiment_id: str):
         experiment = _require_experiment(store, experiment_id)
+        if experiment.status not in {Status.board_approved, Status.render_failed}:
+            request_render(experiment, 0)
+        niche = _require_niche(store, experiment.niche_id)
+        path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
+        beats, digest = _load_board(store, experiment_id)
+        if digest != experiment.board_hash:
+            store.save_experiment(revise_board(experiment, beats))
+            raise HTTPException(status_code=409, detail="storyboard changed since approval")
+        experiment = replace(experiment, script=script_from_beats(beats))
         day = _today()
         started = store.renders_started_today(day) or 0
         rendering = request_render(experiment, int(started), cap=_render_cap(store))
         store.record_render_start(experiment.id, day)
-        rendered = renderer.render(rendering, _media_dir(store))
+        rendered = renderer.render(rendering, path.parent)
         store.save_experiment(rendered)
-        return _experiment_json(rendered)
+        return _experiment_json(store, rendered)
 
     @app.post("/experiments/{experiment_id}/approve")
     def approve_experiment(experiment_id: str, body: ApproveIn):
         experiment = _require_experiment(store, experiment_id)
         approved = approve(experiment, now=body.now)
         store.save_experiment(approved)
-        return _experiment_json(approved)
+        return _experiment_json(store, approved)
 
     @app.post("/experiments/{experiment_id}/reject")
     def reject_experiment(experiment_id: str):
         experiment = _require_experiment(store, experiment_id)
         rejected = reject(experiment)
         store.save_experiment(rejected)
-        return _experiment_json(rejected)
+        return _experiment_json(store, rejected)
 
     @app.post("/experiments/{experiment_id}/complete")
     def complete_experiment(experiment_id: str):
         experiment = _require_experiment(store, experiment_id)
         closed = complete(experiment)
         store.save_experiment(closed)
-        return _experiment_json(closed)
+        return _experiment_json(store, closed)
 
     @app.post("/experiments/{experiment_id}/publications")
     def publish_experiment(experiment_id: str, body: PublicationIn):
@@ -302,20 +425,30 @@ def create_app(store, renderer: Renderer | None = None, publisher: Publisher | N
         experiments = list(store.list_experiments())
         rows = []
         for experiment in experiments:
-            payload = _experiment_json(experiment)
+            payload = _experiment_json(store, experiment)
             payload["below_sample_floor"] = below_sample_floor(cell_size(experiments, experiment))
             rows.append(payload)
         return rows
 
     @app.post("/starter")
     def start_grid(body: StarterIn):
-        money = _money_from(body.money)
-        drafts = starter_grid(body.niche_ids, money, body.hook_id, body.voice_id, body.presenter_id)
+        try:
+            money = _money_from(body.money)
+            niches = [_require_niche(store, niche_id) for niche_id in body.niche_ids]
+            drafts = starter_grid(
+                body.niche_ids, money, body.hook_id, body.voice_id, body.presenter_id
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         created = []
+        niche_by_id = {niche.id: niche for niche in niches}
         for draft in drafts:
             experiment = _experiment_from_draft(draft)
+            niche = niche_by_id[draft.niche_id]
+            path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
+            write_storyboard(path, draft.beats)
             store.insert_experiment(experiment)
-            created.append(_experiment_json(experiment))
+            created.append(_experiment_json(store, experiment))
         return created
 
     @app.post("/suggest")
@@ -400,13 +533,60 @@ def _require_publication(store, publication_id: str) -> Publication:
     raise HTTPException(status_code=404, detail="unknown publication")
 
 
-def _experiment_from_body(raw: dict) -> Experiment:
+def _beats_from_payload(raw: dict) -> tuple[Beat, ...]:
+    beats = raw.get("beats")
+    if beats is not None:
+        parsed: list[Beat] = []
+        for item in beats:
+            if not isinstance(item, dict) or "spoken" not in item:
+                raise ValueError("beat needs a spoken line")
+            parsed.append(
+                Beat(
+                    spoken=str(item["spoken"]),
+                    on_screen=str(item.get("on_screen") or ""),
+                    visual_note=str(item.get("visual_note") or ""),
+                )
+            )
+        return tuple(parsed)
+    if raw.get("script") is None:
+        raise ValueError("script or beats is required")
+    return (Beat(spoken=str(raw["script"]), on_screen="", visual_note=""),)
+
+
+def _require_niche(store, niche_id: str):
+    check_segment(niche_id)
+    niche = store.get_niche(niche_id)
+    if niche is None:
+        raise HTTPException(status_code=422, detail=f"unknown niche {niche_id}")
+    check_segment(niche.theme_id)
+    return niche
+
+
+def _load_board(store, experiment_id: str) -> tuple[tuple[Beat, ...], str]:
+    experiment = _require_experiment(store, experiment_id)
+    niche = _require_niche(store, experiment.niche_id)
+    path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
+    try:
+        return read_storyboard(path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=422, detail="storyboard file is missing") from exc
+
+
+def _beat_json(beat: Beat) -> dict[str, str]:
+    return {
+        "spoken": beat.spoken,
+        "on_screen": beat.on_screen,
+        "visual_note": beat.visual_note,
+    }
+
+
+def _experiment_from_body(raw: dict, beats: tuple[Beat, ...]) -> Experiment:
     return Experiment(
         id=raw.get("id") or uuid4().hex,
         niche_id=raw["niche_id"],
         hypothesis=raw["hypothesis"],
         hook_id=raw["hook_id"],
-        script=raw["script"],
+        script=script_from_beats(beats),
         caption=raw["caption"],
         style=_style_from(raw["style"]),
         money=_money_from(raw["money"]),
@@ -457,9 +637,11 @@ def _money_json(money) -> dict:
     return {"kind": "platform_payout", "platform": money.platform.value}
 
 
-def _experiment_json(experiment: Experiment) -> dict:
+def _experiment_json(store, experiment: Experiment) -> dict:
+    niche = store.get_niche(experiment.niche_id)
     return {
         "id": experiment.id,
+        "theme_id": None if niche is None else niche.theme_id,
         "niche_id": experiment.niche_id,
         "hypothesis": experiment.hypothesis,
         "hook_id": experiment.hook_id,
@@ -477,6 +659,7 @@ def _experiment_json(experiment: Experiment) -> dict:
         "language": experiment.language,
         "clicks": experiment.clicks,
         "revenue_cents": experiment.revenue_cents,
+        "board_hash": experiment.board_hash,
     }
 
 
@@ -510,4 +693,5 @@ def _draft_json(draft: DraftSpec) -> dict:
         "script": draft.script,
         "caption": draft.caption,
         "length_sec": draft.length_sec,
+        "beats": [_beat_json(beat) for beat in draft.beats],
     }

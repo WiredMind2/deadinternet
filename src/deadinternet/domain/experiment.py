@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Literal
@@ -5,6 +6,7 @@ from typing import Literal
 
 class Status(StrEnum):
     draft = "draft"
+    board_approved = "board_approved"
     rendering = "rendering"
     render_failed = "render_failed"
     in_review = "in_review"
@@ -33,6 +35,8 @@ class PublicationStatus(StrEnum):
 
 
 class Event(StrEnum):
+    approve_board = "approve_board"
+    revise_board = "revise_board"
     start_render = "start_render"
     render_ok = "render_ok"
     render_fail = "render_fail"
@@ -55,6 +59,10 @@ class RenderCapReached(DomainError):
 
 
 class IneligibleLength(DomainError):
+    pass
+
+
+class InvalidBoard(DomainError):
     pass
 
 
@@ -100,6 +108,27 @@ Money = Affiliate | PlatformPayout | OwnOffer
 
 
 @dataclass(frozen=True)
+class Beat:
+    spoken: str
+    on_screen: str = ""
+    visual_note: str = ""
+
+
+@dataclass(frozen=True)
+class Theme:
+    id: str
+    name: str
+    language: str
+
+
+@dataclass(frozen=True)
+class Niche:
+    id: str
+    theme_id: str
+    name: str
+
+
+@dataclass(frozen=True)
 class Experiment:
     id: str
     niche_id: str
@@ -119,6 +148,7 @@ class Experiment:
     language: str = "en"
     clicks: int = 0
     revenue_cents: int = 0
+    board_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,8 +164,11 @@ class Publication:
 
 
 _ALLOWED: dict[tuple[Status, Event], Status] = {
-    (Status.draft, Event.start_render): Status.rendering,
+    (Status.draft, Event.approve_board): Status.board_approved,
+    (Status.board_approved, Event.revise_board): Status.draft,
+    (Status.board_approved, Event.start_render): Status.rendering,
     (Status.render_failed, Event.start_render): Status.rendering,
+    (Status.render_failed, Event.revise_board): Status.draft,
     (Status.rendering, Event.render_ok): Status.in_review,
     (Status.rendering, Event.render_fail): Status.render_failed,
     (Status.in_review, Event.approve): Status.approved,
@@ -151,6 +184,32 @@ def transition(experiment: Experiment, event: Event) -> Experiment:
     if nxt is None:
         raise InvalidTransition(f"{experiment.status.value} cannot {event.value}")
     return replace(experiment, status=nxt)
+
+
+def script_from_beats(beats: Sequence[Beat]) -> str:
+    return "\n".join(beat.spoken for beat in beats)
+
+
+def require_approvable(beats: Sequence[Beat]) -> None:
+    if len(beats) < 1:
+        raise InvalidBoard("storyboard needs at least one beat")
+    for beat in beats:
+        if not beat.spoken.strip():
+            raise InvalidBoard("every beat needs a spoken line")
+
+
+def approve_board(experiment: Experiment, beats: Sequence[Beat], board_hash: str) -> Experiment:
+    require_approvable(beats)
+    moved = transition(experiment, Event.approve_board)
+    return replace(moved, script=script_from_beats(beats), board_hash=board_hash)
+
+
+def revise_board(experiment: Experiment, beats: Sequence[Beat]) -> Experiment:
+    script = script_from_beats(beats)
+    if experiment.status is Status.draft:
+        return replace(experiment, script=script, board_hash=None)
+    moved = transition(experiment, Event.revise_board)
+    return replace(moved, script=script, board_hash=None)
 
 
 def request_render(experiment: Experiment, renders_started_today: int, cap: int = 8) -> Experiment:

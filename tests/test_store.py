@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from dataclasses import replace
 
 import pytest
@@ -251,8 +253,9 @@ def test_add_click_matches_affiliate_or_own_offer_tracking_code(tmp_path):
 
 def test_catalog_lists_ids_and_every_experiment(tmp_path):
     store = Store(str(tmp_path / "lab.sqlite"))
-    store.upsert_niche("niche-1", "Floor mats")
-    store.upsert_niche("niche-1", "Floor mats", language="fr")
+    store.upsert_theme("history", "History")
+    store.upsert_theme("history", "History", language="fr")
+    store.upsert_niche("niche-1", "history", "Floor mats")
     store.upsert_presenter("presenter-1", "Alex", "heygen")
     store.upsert_voice("voice-1", "Nova", "eleven")
     store.upsert_voice("voice-2", "Reed", "eleven")
@@ -266,7 +269,10 @@ def test_catalog_lists_ids_and_every_experiment(tmp_path):
     store.insert_experiment(avatar)
 
     catalog = store.catalog()
+    assert catalog.theme_ids == frozenset({"history"})
+    assert store.get_theme("history").language == "fr"
     assert catalog.niche_ids == frozenset({"niche-1"})
+    assert store.get_niche("niche-1").theme_id == "history"
     assert catalog.presenter_ids == frozenset({"presenter-1"})
     assert catalog.voice_ids == frozenset({"voice-1", "voice-2"})
     assert catalog.hook_ids == frozenset({"question", "result"})
@@ -316,3 +322,77 @@ def test_snapshots_keep_insert_order(tmp_path):
         },
     ]
     assert store.list_snapshots("missing") == []
+
+
+def test_legacy_niche_rows_become_a_theme_and_a_series(tmp_path):
+    path = tmp_path / "legacy.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE niches (id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO niches (id, name, language) VALUES ('history', 'History', 'en')")
+    conn.execute(
+        """
+        CREATE TABLE experiments (
+            id TEXT PRIMARY KEY,
+            niche_id TEXT NOT NULL,
+            hypothesis TEXT NOT NULL,
+            hook_id TEXT NOT NULL,
+            script TEXT NOT NULL,
+            caption TEXT NOT NULL,
+            style_json TEXT NOT NULL,
+            money_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            length_sec INTEGER NOT NULL,
+            proposal_id TEXT,
+            approved_at TEXT,
+            measurement_window_days INTEGER NOT NULL,
+            file_path TEXT,
+            render_error TEXT,
+            language TEXT NOT NULL,
+            clicks INTEGER NOT NULL DEFAULT 0,
+            revenue_cents INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO experiments (
+            id, niche_id, hypothesis, hook_id, script, caption, style_json, money_json,
+            status, length_sec, measurement_window_days, language
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "exp-old",
+            "history",
+            "Keep the old cell",
+            "question",
+            "Old script",
+            "Old caption",
+            json.dumps(
+                {
+                    "kind": "faceless",
+                    "look": "stills",
+                    "voice_id": "voice-1",
+                    "caption_style": "bold",
+                }
+            ),
+            json.dumps({"kind": "affiliate", "tracking_code": "abc", "merchant": "acme"}),
+            "draft",
+            45,
+            7,
+            "en",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(str(path))
+    assert store.get_theme("history").language == "en"
+    niche = store.get_niche("history")
+    assert niche.theme_id == "history"
+    assert niche.name == "History"
+    loaded = store.get_experiment("exp-old")
+    assert loaded.niche_id == "history"
+    assert loaded.script == "Old script"
+    assert loaded.board_hash is None

@@ -14,6 +14,7 @@ from deadinternet.domain.experiment import (
     FacelessStyle,
     Look,
     Money,
+    Niche,
     OwnOffer,
     Platform,
     PlatformPayout,
@@ -21,14 +22,21 @@ from deadinternet.domain.experiment import (
     PublicationStatus,
     Status,
     Style,
+    Theme,
 )
 from deadinternet.domain.proposal import Catalog
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS niches (
+CREATE TABLE IF NOT EXISTS themes (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     language TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS niches (
+    id TEXT PRIMARY KEY,
+    theme_id TEXT NOT NULL,
+    name TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS presenters (
@@ -84,7 +92,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     render_error TEXT,
     language TEXT NOT NULL,
     clicks INTEGER NOT NULL DEFAULT 0,
-    revenue_cents INTEGER NOT NULL DEFAULT 0
+    revenue_cents INTEGER NOT NULL DEFAULT 0,
+    board_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS render_starts (
@@ -214,6 +223,7 @@ def _experiment_values(experiment: Experiment) -> tuple:
         experiment.language,
         experiment.clicks,
         experiment.revenue_cents,
+        experiment.board_hash,
     )
 
 
@@ -237,6 +247,7 @@ def _experiment_from_row(row: sqlite3.Row) -> Experiment:
         language=row["language"],
         clicks=row["clicks"],
         revenue_cents=row["revenue_cents"],
+        board_hash=row["board_hash"],
     )
 
 
@@ -273,18 +284,102 @@ class Store:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._migrate_legacy_niches()
         self._conn.executescript(_SCHEMA)
+        self._ensure_board_hash()
 
-    def upsert_niche(self, id: str, name: str, language: str = "en") -> None:
+    def _column_names(self, table: str) -> set[str]:
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if row is None:
+            return set()
+        info = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {item["name"] for item in info}
+
+    def _migrate_legacy_niches(self) -> None:
+        if "language" not in self._column_names("niches"):
+            return
+        with self._conn:
+            self._conn.execute("ALTER TABLE niches RENAME TO themes")
+            self._conn.execute(
+                """
+                CREATE TABLE niches (
+                    id TEXT PRIMARY KEY,
+                    theme_id TEXT NOT NULL,
+                    name TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO niches (id, theme_id, name)
+                SELECT id, id, name FROM themes
+                """
+            )
+
+    def _ensure_board_hash(self) -> None:
+        columns = self._column_names("experiments")
+        if columns and "board_hash" not in columns:
+            self._conn.execute("ALTER TABLE experiments ADD COLUMN board_hash TEXT")
+            self._conn.commit()
+
+    def upsert_theme(self, id: str, name: str, language: str = "en") -> None:
         self._write(
             """
-            INSERT INTO niches (id, name, language) VALUES (?, ?, ?)
+            INSERT INTO themes (id, name, language) VALUES (?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 language = excluded.language
             """,
             (id, name, language),
         )
+
+    def upsert_niche(self, id: str, theme_id: str, name: str) -> None:
+        if self.get_theme(theme_id) is None:
+            raise KeyError(theme_id)
+        self._write(
+            """
+            INSERT INTO niches (id, theme_id, name) VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                theme_id = excluded.theme_id,
+                name = excluded.name
+            """,
+            (id, theme_id, name),
+        )
+
+    def get_theme(self, id: str) -> Theme | None:
+        row = self._conn.execute(
+            "SELECT id, name, language FROM themes WHERE id = ?",
+            (id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Theme(id=row["id"], name=row["name"], language=row["language"])
+
+    def list_themes(self) -> list[Theme]:
+        rows = self._conn.execute(
+            "SELECT id, name, language FROM themes ORDER BY id"
+        ).fetchall()
+        return [Theme(id=row["id"], name=row["name"], language=row["language"]) for row in rows]
+
+    def get_niche(self, id: str) -> Niche | None:
+        row = self._conn.execute(
+            "SELECT id, theme_id, name FROM niches WHERE id = ?",
+            (id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Niche(id=row["id"], theme_id=row["theme_id"], name=row["name"])
+
+    def list_niches(self) -> list[Niche]:
+        rows = self._conn.execute(
+            "SELECT id, theme_id, name FROM niches ORDER BY id"
+        ).fetchall()
+        return [
+            Niche(id=row["id"], theme_id=row["theme_id"], name=row["name"]) for row in rows
+        ]
 
     def upsert_presenter(self, id: str, name: str, provider: str) -> None:
         self._write(
@@ -365,8 +460,8 @@ class Store:
                 id, niche_id, hypothesis, hook_id, script, caption,
                 style_json, money_json, status, length_sec,
                 proposal_id, approved_at, measurement_window_days,
-                file_path, render_error, language, clicks, revenue_cents
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_path, render_error, language, clicks, revenue_cents, board_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _experiment_values(experiment),
         )
@@ -401,7 +496,8 @@ class Store:
                 render_error = ?,
                 language = ?,
                 clicks = ?,
-                revenue_cents = ?
+                revenue_cents = ?,
+                board_hash = ?
             WHERE id = ?
             """,
             _experiment_values(experiment)[1:] + (experiment.id,),
@@ -598,10 +694,11 @@ class Store:
             offer_ids=frozenset(offer_ids),
             hook_ids=self._ids("hooks"),
             parents=parents,
+            theme_ids=self._ids("themes"),
         )
 
     def _ids(self, table: str) -> frozenset[str]:
-        if table not in {"niches", "presenters", "voices", "hooks"}:
+        if table not in {"themes", "niches", "presenters", "voices", "hooks"}:
             raise ValueError(table)
         rows = self._conn.execute(f"SELECT id FROM {table}").fetchall()
         return frozenset(row["id"] for row in rows)

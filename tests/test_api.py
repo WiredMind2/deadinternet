@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -16,6 +17,11 @@ from tests.helpers import experiment, experiment_body, open_store
 NOW = "2026-10-31T12:00:00Z"
 
 
+def _series(store, niche_id="niche-1", theme_id="history", name="Series"):
+    store.upsert_theme(theme_id, "History")
+    store.upsert_niche(niche_id, theme_id, name)
+
+
 class _SpyRenderer:
     def __init__(self):
         self.calls = []
@@ -31,6 +37,7 @@ class _SpyRenderer:
 
 def test_approve_on_a_draft_returns_409(tmp_path):
     store = open_store(tmp_path)
+    _series(store)
     with TestClient(create_app(store)) as client:
         created = client.post("/experiments", json=experiment_body())
         assert created.status_code == 200
@@ -93,7 +100,8 @@ def test_redirect_records_one_experiments_click(tmp_path):
 
 def test_suggest_does_not_create_a_video_file(tmp_path):
     store = open_store(tmp_path)
-    store.upsert_niche("niche-1", "Niche")
+    store.upsert_theme("history", "History")
+    store.upsert_niche("niche-1", "history", "Niche")
     store.upsert_presenter("presenter-1", "Alex", "heygen")
     store.upsert_voice("voice-1", "Nova", "eleven")
     store.upsert_hook("question", "Question")
@@ -113,6 +121,7 @@ def test_suggest_does_not_create_a_video_file(tmp_path):
         response = client.post("/suggest")
     assert response.status_code == 200
     assert len(response.json()) == 1
+    assert response.json()[0]["beats"][0]["spoken"] == response.json()[0]["script"]
     assert spy.calls == []
     assert [row.id for row in store.list_experiments()] == ["exp-parent"]
     assert list(tmp_path.rglob("*.mp4")) == []
@@ -120,6 +129,8 @@ def test_suggest_does_not_create_a_video_file(tmp_path):
 
 def test_starter_inserts_drafts_without_rendering(tmp_path):
     store = open_store(tmp_path)
+    _series(store, "niche-1")
+    _series(store, "niche-2")
     spy = _SpyRenderer()
     with TestClient(create_app(store, renderer=spy)) as client:
         response = client.post(
@@ -140,26 +151,36 @@ def test_starter_inserts_drafts_without_rendering(tmp_path):
     assert [row["style"]["kind"] for row in body].count("avatar") == 2
     assert spy.calls == []
     assert len(store.list_experiments()) == 4
+    assert len(list(tmp_path.rglob("*.storyboard.json"))) == 4
     assert list(tmp_path.rglob("*.mp4")) == []
 
 
 def test_render_reaches_review_and_the_cap_is_429(tmp_path):
     store = open_store(tmp_path)
-    store.insert_experiment(experiment(id="exp-render"))
+    _series(store)
     with TestClient(create_app(store)) as client:
+        created = client.post("/experiments", json=experiment_body(id="exp-render"))
+        assert created.status_code == 200
+        approved = client.post("/experiments/exp-render/approve-board")
+        assert approved.status_code == 200
         rendered = client.post("/experiments/exp-render/render")
         assert rendered.status_code == 200
         assert rendered.json()["status"] == "in_review"
-        assert rendered.json()["file_path"].endswith("exp-render.mp4")
+        file_path = rendered.json()["file_path"]
+        assert "history" in file_path
+        assert "niche-1" in file_path
+        assert file_path.endswith("exp-render.mp4")
         again = client.post("/experiments/exp-render/render")
         assert again.status_code == 409
     assert store.get_experiment("exp-render").status == Status.in_review
     store.set_setting("render_cap", 0)
-    store.insert_experiment(experiment(id="exp-capped"))
     with TestClient(create_app(store)) as client:
+        created = client.post("/experiments", json=experiment_body(id="exp-capped"))
+        assert created.status_code == 200
+        assert client.post("/experiments/exp-capped/approve-board").status_code == 200
         capped = client.post("/experiments/exp-capped/render")
     assert capped.status_code == 429
-    assert store.get_experiment("exp-capped").status == Status.draft
+    assert store.get_experiment("exp-capped").status == Status.board_approved
 
 
 def test_publish_duplicate_url_and_manual_url(tmp_path):
@@ -206,3 +227,59 @@ def test_publish_duplicate_url_and_manual_url(tmp_path):
         assert posted.json()["status"] == "posted"
         assert posted.json()["post_url"] == "https://instagram.example/manual/1"
     assert store.get_experiment("exp-manual").status == Status.live
+
+
+def test_unknown_niche_and_a_draft_render_are_refused(tmp_path):
+    store = open_store(tmp_path)
+    with TestClient(create_app(store)) as client:
+        missing = client.post("/experiments", json=experiment_body())
+        assert missing.status_code == 422
+        _series(store)
+        created = client.post("/experiments", json=experiment_body())
+        assert created.status_code == 200
+        refused = client.post("/experiments/exp-1/render")
+        assert refused.status_code == 409
+    assert store.get_experiment("exp-1").status == Status.draft
+
+
+def test_a_changed_storyboard_does_not_spend_a_render(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    with TestClient(create_app(store)) as client:
+        assert client.post("/experiments", json=experiment_body()).status_code == 200
+        assert client.post("/experiments/exp-1/approve-board").status_code == 200
+        board = tmp_path / "media" / "history" / "niche-1" / "exp-1.storyboard.json"
+        text = board.read_text(encoding="utf-8")
+        board.write_text(text.replace("spoken script", "other script"), encoding="utf-8")
+        refused = client.post("/experiments/exp-1/render")
+        assert refused.status_code == 409
+    assert store.get_experiment("exp-1").status == Status.draft
+    assert store.get_experiment("exp-1").board_hash is None
+    day = datetime.now(timezone.utc).date().isoformat()
+    assert store.renders_started_today(day) == 0
+
+
+def test_save_before_the_file_review_and_a_locked_board(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    beats = [
+        {"spoken": "First line.", "on_screen": "One", "visual_note": "wide"},
+        {"spoken": "Second line.", "on_screen": "", "visual_note": "close"},
+    ]
+    with TestClient(create_app(store)) as client:
+        assert client.post("/experiments", json=experiment_body()).status_code == 200
+        saved = client.put("/experiments/exp-1/storyboard", json={"beats": beats})
+        assert saved.status_code == 200
+        assert saved.json()["script"] == "First line.\nSecond line."
+        assert saved.json()["status"] == "draft"
+        assert client.post("/experiments/exp-1/approve-board").status_code == 200
+        rendered = client.post("/experiments/exp-1/render")
+        assert rendered.status_code == 200
+        board = tmp_path / "media" / "history" / "niche-1" / "exp-1.storyboard.json"
+        before = board.read_text(encoding="utf-8")
+        locked = client.put(
+            "/experiments/exp-1/storyboard",
+            json={"beats": [{"spoken": "Too late.", "on_screen": "", "visual_note": ""}]},
+        )
+        assert locked.status_code == 409
+        assert board.read_text(encoding="utf-8") == before

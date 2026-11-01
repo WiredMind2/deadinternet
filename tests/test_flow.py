@@ -8,7 +8,8 @@ from tests.helpers import open_store
 
 
 def _seed(store) -> None:
-    store.upsert_niche("niche-1", "Niche")
+    store.upsert_theme("history", "History")
+    store.upsert_niche("niche-1", "history", "Niche")
     store.upsert_voice("voice-1", "Voice", "local")
     store.upsert_presenter("presenter-1", "Presenter", "local")
     store.upsert_hook("question", "Question")
@@ -34,6 +35,9 @@ def test_flow_from_starter_grid_to_a_draft_proposal(tmp_path):
     faceless = next(row for row in started.json() if row["style"]["kind"] == "faceless")
     avatar = next(row for row in started.json() if row["style"]["kind"] == "avatar")
     experiment_id = faceless["id"]
+    board = client.post(f"/experiments/{experiment_id}/approve-board")
+    assert board.status_code == 200, board.text
+    assert board.json()["status"] == "board_approved"
     store.save_experiment(
         replace(
             store.get_experiment(avatar["id"]),
