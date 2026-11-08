@@ -12,6 +12,7 @@ export default defineConfig({
       "/starter": { target: api },
       "/suggest": { target: api },
       "/publications": { target: api },
+      "/snapshots": { target: api },
       "/catalog": { target: api },
       "/themes": { target: api },
       "/niches": { target: api },

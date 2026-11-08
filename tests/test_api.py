@@ -229,6 +229,39 @@ def test_publish_duplicate_url_and_manual_url(tmp_path):
     assert store.get_experiment("exp-manual").status == Status.live
 
 
+def test_results_report_views_from_the_latest_snapshots(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    with TestClient(create_app(store)) as client:
+        assert client.post("/experiments", json=experiment_body(id="exp-views")).status_code == 200
+        assert client.post("/experiments/exp-views/approve-board").status_code == 200
+        assert client.post("/experiments/exp-views/render").status_code == 200
+        assert client.post("/experiments/exp-views/approve", json={"now": NOW}).status_code == 200
+        posted = client.post(
+            "/experiments/exp-views/publications",
+            json={"platform": "tiktok", "account_id": "acct-1", "token": "secret"},
+        )
+        assert posted.status_code == 200
+        assert posted.json()["status"] == "posted"
+        client.post("/snapshots", json={"publication_id": posted.json()["id"], "views": 100})
+        client.post("/snapshots", json={"publication_id": posted.json()["id"], "views": 250})
+        manual = client.post(
+            "/experiments/exp-views/publications",
+            json={"platform": "youtube", "account_id": "acct-1", "token": ""},
+        )
+        assert manual.json()["status"] == "manual_needed"
+        assert client.post(
+            f"/publications/{manual.json()['id']}/url",
+            json={"url": "https://youtube.example/v/1"},
+        ).status_code == 200
+        plain = client.post("/experiments", json=experiment_body(id="exp-plain"))
+        assert plain.status_code == 200
+        rows = client.get("/results").json()
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["exp-views"]["views"] == 250
+    assert by_id["exp-plain"]["views"] == 0
+
+
 def test_unknown_niche_and_a_draft_render_are_refused(tmp_path):
     store = open_store(tmp_path)
     with TestClient(create_app(store)) as client:
