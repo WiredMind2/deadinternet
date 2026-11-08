@@ -215,6 +215,30 @@ function Facts({ rows }) {
   );
 }
 
+function TrackingLink({ code }) {
+  const [copied, setCopied] = useState(false);
+  const url = `${window.location.origin}/r/${code}`;
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <span className="tracking-link">
+      <code>{url}</code>
+      <button type="button" onClick={copy} aria-label={`Copy tracking link ${url}`}>
+        {copied ? "Copied" : "Copy"}
+      </button>
+      {!copied ? null : <span role="status">Link copied to the clipboard.</span>}
+    </span>
+  );
+}
+
 function experimentFacts(experiment, { includeCopy = true } = {}) {
   const style = experiment.style && typeof experiment.style === "object" ? experiment.style : {};
   const money = experiment.money && typeof experiment.money === "object" ? experiment.money : {};
@@ -241,6 +265,12 @@ function experimentFacts(experiment, { includeCopy = true } = {}) {
   if (money.merchant) rows.push({ label: "merchant", value: show(money.merchant) });
   if (money.tracking_code) rows.push({ label: "tracking_code", value: show(money.tracking_code) });
   if (money.offer_url) rows.push({ label: "offer_url", value: show(money.offer_url), wide: true });
+  if (experiment.render_error) {
+    rows.push({ label: "render_error", value: show(experiment.render_error), wide: true });
+  }
+  if ((money.kind === "affiliate" || money.kind === "own_offer") && money.tracking_code) {
+    rows.push({ label: "tracking link", value: <TrackingLink code={money.tracking_code} /> });
+  }
   if (includeCopy) {
     rows.push(
       { label: "script", value: show(experiment.script), wide: true },
@@ -463,6 +493,22 @@ function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error 
   const [style, setStyle] = useState("");
   const [money, setMoney] = useState("");
   const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState("");
+  const [actionError, setActionError] = useState("");
+
+  async function completeVideo() {
+    if (!selected || selected.status !== "live") return;
+    setBusy("complete");
+    setActionError("");
+    try {
+      await api(`/experiments/${encodeURIComponent(selected.id)}/complete`, { method: "POST" });
+      await onChanged(`Completed ${selected.id}.`);
+    } catch (err) {
+      setActionError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
 
   const filtered = useMemo(
     () =>
@@ -573,7 +619,15 @@ function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error 
         </div>
         <section className="panel">
           <h2>Selected</h2>
+          <Banner>{actionError}</Banner>
           {selected ? <Facts rows={experimentFacts(selected)} /> : <p>Select a row.</p>}
+          {selected && selected.status === "live" ? (
+            <div className="actions">
+              <button type="button" onClick={completeVideo} disabled={Boolean(busy)}>
+                Complete
+              </button>
+            </div>
+          ) : null}
           {selected ? <StoryboardEditor experiment={selected} onChanged={onChanged} /> : null}
         </section>
       </div>
@@ -935,28 +989,28 @@ function Proposals({ drafts, setDrafts, onAccepted }) {
     }
   }
 
-  async function acceptDrafts() {
-    if (drafts.length === 0) {
-      setError("Suggest first. There are no drafts to accept.");
-      return;
-    }
-    setBusy("accept");
+  async function acceptDraft(index) {
+    const draft = drafts[index];
+    if (!draft) return;
+    setBusy(`accept-${index}`);
     setError("");
     try {
-      for (const draft of drafts) {
-        await api("/experiments", {
-          method: "POST",
-          body: JSON.stringify(draftPayload(draft)),
-        });
-      }
-      const count = drafts.length;
-      setDrafts([]);
-      await onAccepted(`Accepted ${count} draft${count === 1 ? "" : "s"}.`);
+      await api("/experiments", {
+        method: "POST",
+        body: JSON.stringify(draftPayload(draft)),
+      });
+      setDrafts((current) => current.filter((_item, position) => position !== index));
+      await onAccepted(`Accepted draft ${index + 1}.`);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
       setBusy("");
     }
+  }
+
+  function discardDraft(index) {
+    setError("");
+    setDrafts((current) => current.filter((_item, position) => position !== index));
   }
 
   return (
@@ -967,11 +1021,8 @@ function Proposals({ drafts, setDrafts, onAccepted }) {
         <button type="button" onClick={suggest} disabled={busy === "suggest"}>
           Suggest
         </button>
-        <button type="button" onClick={acceptDrafts} disabled={busy === "accept"}>
-          Accept drafts
-        </button>
       </div>
-      {drafts.length === 0 ? <p className="meta">No drafts yet.</p> : null}
+      {drafts.length === 0 ? <p className="meta">No drafts yet. Suggest to ask for one.</p> : null}
       <div className="stack">
         {drafts.map((draft, index) => {
           const diffs = Array.isArray(draft.factor_diffs) ? draft.factor_diffs : [];
@@ -1023,6 +1074,23 @@ function Proposals({ drafts, setDrafts, onAccepted }) {
                   { label: "caption", value: show(draft.caption), wide: true },
                 ]}
               />
+              <div className="actions">
+                <button
+                  type="button"
+                  onClick={() => acceptDraft(index)}
+                  disabled={Boolean(busy)}
+                >
+                  {busy === `accept-${index}` ? "Accepting…" : "Accept"}
+                </button>
+                <button
+                  type="button"
+                  className="danger"
+                  onClick={() => discardDraft(index)}
+                  disabled={Boolean(busy)}
+                >
+                  Discard
+                </button>
+              </div>
             </article>
           );
         })}
