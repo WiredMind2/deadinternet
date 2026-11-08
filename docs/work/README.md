@@ -9,11 +9,11 @@ index and `archive/` before minting a new one.
 |---|---|---|---|
 | US-001 | Run the backend tests on this machine regardless of global site-packages | 1 | Done |
 | US-002 | Recover the fix-pipeline-ux worktree features onto main, then remove that worktree | 5 | Ready |
-| US-003 | Close a finished video from the dashboard | 2 | Ready |
-| US-004 | Show snapshot views on Results | 3 | Ready |
-| US-005 | Copy a video's tracking link from the dashboard | 2 | Ready |
-| US-006 | Show why a render failed | 1 | Ready |
-| US-007 | Accept or discard each suggested draft on its own | 3 | Ready |
+| US-003 | Close a finished video from the dashboard | 2 | Done |
+| US-004 | Show snapshot views on Results | 3 | Done |
+| US-005 | Copy a video's tracking link from the dashboard | 2 | Done |
+| US-006 | Show why a render failed | 1 | Done |
+| US-007 | Accept or discard each suggested draft on its own | 3 | Done |
 | US-008 | Recover the vendor-ig-tools proposer lint work onto main, then remove that worktree | 3 | Ready |
 
 ## Collisions
