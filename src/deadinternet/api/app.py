@@ -446,6 +446,7 @@ def create_app(
         rows = []
         for experiment in experiments:
             payload = _experiment_json(store, experiment)
+            payload["views"] = _views_for(store, experiment.id)
             payload["below_sample_floor"] = below_sample_floor(cell_size(experiments, experiment))
             rows.append(payload)
         return rows
@@ -547,6 +548,16 @@ def _publications(store) -> list[Publication]:
         for experiment in store.list_experiments():
             rows.extend(method(experiment.id))
         return rows
+
+
+def _views_for(store, experiment_id: str) -> int:
+    """Sum the latest snapshot views of every publication of one experiment."""
+    total = 0
+    for publication in store.list_publications(experiment_id):
+        snapshots = store.list_snapshots(publication.id)
+        if snapshots:
+            total += int(snapshots[-1]["views"])
+    return total
 
 
 def _require_publication(store, publication_id: str) -> Publication:
