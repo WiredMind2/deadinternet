@@ -49,8 +49,8 @@ def _draft(**overrides) -> dict:
         "money": {"kind": "affiliate", "tracking_code": "abc", "merchant": "acme"},
         "hook_id": "result",
         "hypothesis": "A result hook beats the question hook.",
-        "script": "A follow-up that is not the parent script.",
-        "caption": "Watch the next cut.",
+        "script": "I lost $18,000 on one missing contract.",
+        "caption": "That contract cost me $18,000.",
         "length_sec": 75,
     }
     body.update(overrides)
@@ -101,7 +101,7 @@ def test_repair_then_submit_keeps_the_first_draft():
         by_name = _tools(tools)
         seen["rejected"] = by_name["validate_draft"].invoke(_draft(niche_id="missing-niche"))
         seen["submitted"] = by_name["submit_draft"].invoke(
-            _draft(parent_ids=[parent.id], script="A follow-up that is not the parent script.")
+            _draft(parent_ids=[parent.id], script="I lost $18,000 on one missing contract.")
         )
         seen["second"] = by_name["submit_draft"].invoke(
             _draft(parent_ids=[parent.id], script="A later script that must not replace the first.")
@@ -111,8 +111,29 @@ def test_repair_then_submit_keeps_the_first_draft():
     assert "unknown niche" in seen["rejected"]
     assert seen["submitted"] == "submitted"
     assert seen["second"] == "already submitted"
-    assert drafts[0].script == "A follow-up that is not the parent script."
+    assert drafts[0].script == "I lost $18,000 on one missing contract."
     assert drafts[0].hook_id == "result"
+
+
+def test_lint_rejection_is_repaired_then_accepted():
+    parent = experiment(id="exp-parent", status=Status.complete)
+    catalog = _catalog(parents={parent.id: parent})
+    seen = {}
+
+    def runner(_model, tools, _prompt, _run):
+        by_name = _tools(tools)
+        seen["rejected"] = by_name["submit_draft"].invoke(
+            _draft(parent_ids=[parent.id], script="Here is how the story goes.")
+        )
+        seen["repaired"] = by_name["submit_draft"].invoke(
+            _draft(parent_ids=[parent.id])
+        )
+
+    drafts = RepairProposer(runner=runner, model=object()).propose([parent], catalog)
+    assert "hook scores" in seen["rejected"]
+    assert "rewrite the first spoken beat" in seen["rejected"]
+    assert seen["repaired"] == "submitted"
+    assert drafts[0].script == "I lost $18,000 on one missing contract."
 
 
 def test_near_copy_submit_is_not_stored():
@@ -140,7 +161,7 @@ def test_route_returns_the_repaired_draft_without_writing(tmp_path):
         parent_id = finished[0]["id"]
         assert "unknown niche" in by_name["validate_draft"].invoke(_draft(niche_id="missing-niche"))
         by_name["submit_draft"].invoke(
-            _draft(parent_ids=[parent_id], script="A follow-up that is not the parent script.")
+            _draft(parent_ids=[parent_id], script="I cut my $140 phone bill to $9 in one call.")
         )
 
     proposer = RepairProposer(runner=runner, model=object())
@@ -149,7 +170,7 @@ def test_route_returns_the_repaired_draft_without_writing(tmp_path):
     assert response.status_code == 200
     body = response.json()
     assert len(body) == 1
-    assert body[0]["script"] == "A follow-up that is not the parent script."
+    assert body[0]["script"] == "I cut my $140 phone bill to $9 in one call."
     assert body[0]["niche_id"] == "niche-1"
     assert [row.id for row in store.list_experiments()] == ["exp-parent"]
     assert list(tmp_path.rglob("*.mp4")) == []
@@ -245,7 +266,7 @@ def test_access_headers_require_both_values():
 def test_graph_error_after_submit_still_returns_the_draft():
     parent = experiment(id="exp-parent", status=Status.complete)
     catalog = _catalog(parents={parent.id: parent})
-    good = _draft(parent_ids=[parent.id], script="Fresh words for the next cut.")
+    good = _draft(parent_ids=[parent.id], script="The second cut saved me 40 bucks a month.")
 
     def factory(_model, tools, prompt):
         assert prompt == SYSTEM_PROMPT
@@ -259,7 +280,7 @@ def test_graph_error_after_submit_still_returns_the_draft():
         return Agent()
 
     drafts = RepairProposer(model=object(), agent_factory=factory).propose([parent], catalog)
-    assert drafts[0].script == "Fresh words for the next cut."
+    assert drafts[0].script == "The second cut saved me 40 bucks a month."
 
 
 def test_graph_error_before_submit_fails_closed():

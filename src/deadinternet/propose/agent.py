@@ -18,6 +18,7 @@ from deadinternet.domain.experiment import (
     Style,
 )
 from deadinternet.domain.proposal import Catalog, DraftSpec, ProposalRejected, parse_proposal
+from deadinternet.propose.lint import draft_problems
 
 MAX_STEPS = 12
 DEFAULT_BASE_URL = "https://llm.tetrazero.com/v1"
@@ -33,6 +34,7 @@ Change a real factor. Use only ids from get_catalog.
 Read the parent script before you write. The new script must not be a near-copy.
 A near-copy is the same script and the same look.
 Call validate_draft before submit_draft. Repair any rejection, then submit once.
+A rejection may name the hook score, the caption fold, or stock phrases. Fix what it names.
 Submit exactly one draft.
 A TikTok Creator Rewards video must be longer than 60 seconds.
 Do not render or post.
@@ -322,6 +324,9 @@ def _evaluate(run: ProposeRun, raw: dict) -> tuple[DraftSpec | None, str]:
         draft = parse_proposal([raw], run.catalog)[0]
     except (ProposalRejected, KeyError, ValueError, TypeError) as exc:
         return None, str(exc)
+    problems = draft_problems(draft)
+    if problems:
+        return None, " ".join(problems)
     return draft, "ok"
 
 
