@@ -110,12 +110,33 @@ async function api(path, options = {}) {
   return data;
 }
 
-function videoSrc(filePath) {
-  if (typeof filePath !== "string") return "";
-  const trimmed = filePath.trim();
-  if (!trimmed || /^javascript:/i.test(trimmed)) return "";
-  return trimmed;
+function videoSrc(experiment) {
+  if (!experiment?.id || blank(experiment.file_path)) return "";
+  return `/media/${encodeURIComponent(experiment.id)}`;
 }
+
+function tiktokTooShort(row) {
+  return (
+    moneyKind(row) === "platform_payout" &&
+    row?.money?.platform === "tiktok" &&
+    Number(row.length_sec) <= 60
+  );
+}
+
+const NEXT_STEP = {
+  draft: "Save the storyboard, then approve the board to unlock render.",
+  board_approved: "Render is unlocked.",
+  rendering: "A render is in progress.",
+  render_failed: "Rendering failed. Fix the problem, then retry the render.",
+  in_review: "Open Review to approve or reject this cut.",
+  approved: "Open Post to publish it.",
+  live: "Record views on Post, then complete the experiment.",
+  rejected: "This experiment was rejected.",
+  complete: "Suggest can use this closed experiment.",
+};
+
+const TIKTOK_LENGTH =
+  "TikTok Creator Rewards videos must be longer than 60 seconds. This one cannot be approved.";
 
 function idList(value) {
   if (!value) return [];
@@ -199,7 +220,7 @@ function publicationFrom(data) {
 }
 
 function emptyPlatformRow() {
-  return { account_id: "", token: "", url: "", publication: null };
+  return { account_id: "", token: "", url: "", views: "", publication: null };
 }
 
 function Facts({ rows }) {
@@ -478,9 +499,12 @@ function StoryboardEditor({ experiment, onChanged }) {
           <button
             type="button"
             onClick={renderVideo}
-            disabled={Boolean(busy) || experiment.status !== "board_approved"}
+            disabled={
+              Boolean(busy) ||
+              !(experiment.status === "board_approved" || experiment.status === "render_failed")
+            }
           >
-            Render
+            {experiment.status === "render_failed" ? "Retry render" : "Render"}
           </button>
         </div>
       </fieldset>
@@ -620,7 +644,15 @@ function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error 
         <section className="panel">
           <h2>Selected</h2>
           <Banner>{actionError}</Banner>
-          {selected ? <Facts rows={experimentFacts(selected)} /> : <p>Select a row.</p>}
+          {selected ? (
+            <>
+              <p>{NEXT_STEP[selected.status] || ""}</p>
+              {tiktokTooShort(selected) ? <Banner>{TIKTOK_LENGTH}</Banner> : null}
+              <Facts rows={experimentFacts(selected)} />
+            </>
+          ) : (
+            <p>Select a row.</p>
+          )}
           {selected && selected.status === "live" ? (
             <div className="actions">
               <button type="button" onClick={completeVideo} disabled={Boolean(busy)}>
@@ -640,7 +672,13 @@ function Review({ experiments, selectedId, onSelect, onChanged }) {
   const selected = queue.find((row) => row.id === selectedId) || queue[0] || null;
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
-  const src = videoSrc(selected?.file_path);
+  const [videoBroken, setVideoBroken] = useState(false);
+  const src = videoSrc(selected);
+  const tooShort = tiktokTooShort(selected);
+
+  useEffect(() => {
+    setVideoBroken(false);
+  }, [selected?.id]);
 
   async function approve() {
     if (!selected) return;
@@ -676,7 +714,8 @@ function Review({ experiments, selectedId, onSelect, onChanged }) {
   return (
     <>
       <Banner>{error}</Banner>
-      {queue.length === 0 ? <p>Nothing is in review.</p> : null}
+      {tooShort ? <Banner>{TIKTOK_LENGTH}</Banner> : null}
+      {queue.length === 0 ? <p>Nothing is in review. Render a draft from the Board.</p> : null}
       <div className="workspace">
         <ul className="picker">
           {queue.map((row) => (
@@ -696,10 +735,17 @@ function Review({ experiments, selectedId, onSelect, onChanged }) {
           <article className="panel">
             <h2 className="mono">{selected.id}</h2>
             <figure className="stage">
-              {src ? (
-                <video controls width="270" height="480" src={src} playsInline />
+              {src && !videoBroken ? (
+                <video
+                  controls
+                  width="270"
+                  height="480"
+                  src={src}
+                  playsInline
+                  onError={() => setVideoBroken(true)}
+                />
               ) : (
-                <p>No rendered file yet.</p>
+                <p>{src ? "The rendered file could not be played." : "No rendered file yet."}</p>
               )}
               <figcaption>
                 file_path <code>{show(selected.file_path)}</code>
@@ -720,7 +766,7 @@ function Review({ experiments, selectedId, onSelect, onChanged }) {
               <Facts rows={experimentFacts(selected, { includeCopy: false })} />
             </section>
             <div className="actions">
-              <button type="button" onClick={approve} disabled={Boolean(busy)}>
+              <button type="button" onClick={approve} disabled={Boolean(busy) || tooShort}>
                 Approve
               </button>
               <button type="button" className="danger" onClick={reject} disabled={Boolean(busy)}>
@@ -740,6 +786,41 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
   const [forms, setForms] = useState({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!selected?.id) return undefined;
+    let cancelled = false;
+    api(`/experiments/${encodeURIComponent(selected.id)}/publications`)
+      .then((data) => {
+        if (cancelled) return;
+        const list = unwrapList(data);
+        setForms((current) => {
+          const existing = current[selected.id] || {
+            tiktok: emptyPlatformRow(),
+            instagram: emptyPlatformRow(),
+            youtube: emptyPlatformRow(),
+          };
+          const next = { ...existing };
+          for (const publication of list) {
+            const platform = publication.platform;
+            if (!next[platform]) continue;
+            next[platform] = {
+              ...next[platform],
+              account_id: next[platform].account_id || publication.account_id || "",
+              url: next[platform].url || publication.post_url || "",
+              publication: next[platform].publication || publication,
+            };
+          }
+          return { ...current, [selected.id]: next };
+        });
+      })
+      .catch((err) => {
+        if (!cancelled) setError(errorMessage(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected?.id]);
 
   const formFor = forms[selected?.id] || {
     tiktok: emptyPlatformRow(),
@@ -767,6 +848,10 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
   async function send(platform) {
     if (!selected) return;
     const row = formFor[platform];
+    if (!row.account_id.trim()) {
+      setError("account_id is required.");
+      return;
+    }
     setBusy(platform);
     setError("");
     try {
@@ -774,13 +859,15 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
         method: "POST",
         body: JSON.stringify({
           platform,
-          account_id: row.account_id,
-          token: row.token,
+          account_id: row.account_id.trim(),
+          token: row.token.trim() ? row.token : null,
         }),
       });
       const publication = publicationFrom(data);
       update(platform, { publication });
-      if (publication?.status !== "manual_needed") {
+      if (publication?.status === "manual_needed") {
+        await onChanged(`${platform} needs a manual post. Paste the URL after you publish it.`);
+      } else {
         await onChanged(`${platform} publication is ${publication?.status || "sent"}.`);
       }
     } catch (err) {
@@ -815,10 +902,52 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
     }
   }
 
+  async function saveSnapshot(platform) {
+    if (!selected) return;
+    const row = formFor[platform];
+    const publicationId = row.publication?.id || row.publication?.publication_id;
+    if (!publicationId) {
+      setError("Post this video before recording views.");
+      return;
+    }
+    const views = Number(row.views);
+    if (!Number.isFinite(views) || views < 0) {
+      setError("Views must be zero or more.");
+      return;
+    }
+    setBusy(`${platform}-views`);
+    setError("");
+    try {
+      await api("/snapshots", {
+        method: "POST",
+        body: JSON.stringify({ publication_id: publicationId, views }),
+      });
+      await onChanged(`Recorded ${views} views for ${platform}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function completeSelected() {
+    if (!selected) return;
+    setBusy("complete");
+    setError("");
+    try {
+      await api(`/experiments/${encodeURIComponent(selected.id)}/complete`, { method: "POST" });
+      await onChanged(`Completed ${selected.id}. Suggest can use it.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <>
       <Banner>{error}</Banner>
-      {ready.length === 0 ? <p>No approved or live experiment.</p> : null}
+      {ready.length === 0 ? <p>No approved or live experiment. Approve a cut in Review first.</p> : null}
       <div className="workspace">
         <ul className="picker">
           {ready.map((row) => (
@@ -840,6 +969,7 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
               <span className="mono">{selected.id}</span>
               <span className={`status status-${selected.status}`}>{selected.status}</span>
             </p>
+            <p className="meta">Leave the token blank. This lab returns a manual pack instead of posting.</p>
             <ol className="platforms">
               {PLATFORMS.map((platform) => {
                 const row = formFor[platform];
@@ -864,7 +994,7 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
                         <label htmlFor={`${selected.id}-${platform}-token`}>token</label>
                         <input
                           id={`${selected.id}-${platform}-token`}
-                          type="text"
+                          type="password"
                           value={row.token}
                           onChange={(event) => update(platform, { token: event.target.value })}
                           autoComplete="off"
@@ -880,6 +1010,7 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
                         publication status <span className="mono">{publication.status}</span>
                       </p>
                     ) : null}
+                    {publication?.error ? <Banner>{publication.error}</Banner> : null}
                     {manual ? (
                       <div className="manual">
                         <p>
@@ -906,10 +1037,38 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
                         </button>
                       </div>
                     ) : null}
+                    {publication?.status === "posted" ? (
+                      <div className="manual">
+                        <div className="filter">
+                          <label htmlFor={`${selected.id}-${platform}-views`}>views</label>
+                          <input
+                            id={`${selected.id}-${platform}-views`}
+                            type="number"
+                            min="0"
+                            value={row.views}
+                            onChange={(event) => update(platform, { views: event.target.value })}
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => saveSnapshot(platform)}
+                          disabled={busy === `${platform}-views`}
+                        >
+                          Record views
+                        </button>
+                      </div>
+                    ) : null}
                   </li>
                 );
               })}
             </ol>
+            {selected.status === "live" ? (
+              <div className="actions">
+                <button type="button" onClick={completeSelected} disabled={busy === "complete"}>
+                  Complete experiment
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -920,6 +1079,7 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
 function Results() {
   const [rows, setRows] = useState([]);
   const [error, setError] = useState("");
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -929,6 +1089,9 @@ function Results() {
       })
       .catch((err) => {
         if (!cancelled) setError(errorMessage(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoaded(true);
       });
     return () => {
       cancelled = true;
@@ -938,12 +1101,14 @@ function Results() {
   return (
     <>
       <Banner>{error}</Banner>
-      {rows.length === 0 && !error ? <p>No results yet.</p> : null}
+      {loaded && rows.length === 0 && !error ? <p>No results yet.</p> : null}
       <div className="score">
         {rows.map((row, index) => {
           const views = viewsOf(row);
           const title = [row.niche_id, styleKind(row), moneyKind(row)].filter(Boolean).join(" · ");
-          const below = row.below_sample_floor === true || row.below_sample_floor === "true";
+          const below =
+            row.status === "complete" &&
+            (row.below_sample_floor === true || row.below_sample_floor === "true");
           return (
             <article key={row.id || `${title}-${index}`} className="panel">
               <h2>{title || row.id || "Cell"}</h2>
@@ -1101,7 +1266,9 @@ function Proposals({ drafts, setDrafts, onAccepted }) {
 
 function Catalog({ onBuilt }) {
   const [hints, setHints] = useState({ themes: [], niches: [], voices: [], presenters: [], hooks: [] });
+  const [renderCap, setRenderCap] = useState(8);
   const [catalogMissing, setCatalogMissing] = useState(false);
+  const [draftLength, setDraftLength] = useState(45);
   const [themeId, setThemeId] = useState("");
   const [nicheIds, setNicheIds] = useState("");
   const [voiceId, setVoiceId] = useState("");
@@ -1120,6 +1287,7 @@ function Catalog({ onBuilt }) {
     try {
       const data = await api("/catalog");
       setHints(normalizeCatalog(data));
+      setRenderCap(Number(data.render_cap) || 8);
       setCatalogMissing(false);
     } catch (err) {
       if (err.status === 404) {
@@ -1134,12 +1302,38 @@ function Catalog({ onBuilt }) {
     loadCatalog();
   }, []);
 
+  const starterSeconds = kind === "platform_payout" && platform === "tiktok" ? 75 : 45;
+
+  useEffect(() => {
+    setDraftLength(starterSeconds);
+  }, [starterSeconds]);
+
   function money() {
     return moneyPayload(kind, platform, trackingCode, merchant, offerUrl);
   }
 
+  function moneyError() {
+    if (kind === "affiliate" && (!trackingCode.trim() || !merchant.trim())) {
+      return "Affiliate drafts need a tracking code and a merchant.";
+    }
+    if (kind === "own_offer" && (!trackingCode.trim() || !offerUrl.trim())) {
+      return "An own offer needs a tracking code and an offer URL.";
+    }
+    return "";
+  }
+
   async function buildStarter(event) {
     event.preventDefault();
+    const niches = splitIds(nicheIds);
+    if (niches.length === 0 || !voiceId.trim() || !presenterId.trim() || !hookId.trim()) {
+      setError("Niche, voice, presenter, and hook are required. The grid writes both styles.");
+      return;
+    }
+    const invalidMoney = moneyError();
+    if (invalidMoney) {
+      setError(invalidMoney);
+      return;
+    }
     setBusy("starter");
     setError("");
     try {
@@ -1212,8 +1406,22 @@ function Catalog({ onBuilt }) {
 
   async function saveExperimentDraft() {
     const niches = splitIds(nicheIds);
-    if (niches.length === 0) {
-      setError("Enter a niche id.");
+    if (niches.length === 0 || !hookId.trim() || !voiceId.trim()) {
+      setError("Niche, voice, and hook are required.");
+      return;
+    }
+    const length = Number(draftLength);
+    if (!Number.isInteger(length) || length <= 0) {
+      setError("Length must be a whole number of seconds.");
+      return;
+    }
+    if (kind === "platform_payout" && platform === "tiktok" && length <= 60) {
+      setError(TIKTOK_LENGTH);
+      return;
+    }
+    const invalidMoney = moneyError();
+    if (invalidMoney) {
+      setError(invalidMoney);
       return;
     }
     setBusy("draft");
@@ -1229,7 +1437,7 @@ function Catalog({ onBuilt }) {
             hypothesis: `Compare styles in ${nicheId}`,
             script: `Draft script for ${nicheId}.`,
             caption: `Draft caption for ${nicheId}.`,
-            length_sec: 45,
+            length_sec: length,
             style: styleFromForm(voiceId, presenterId),
             money: money(),
           }),
@@ -1249,8 +1457,12 @@ function Catalog({ onBuilt }) {
     <>
       <Banner>{error}</Banner>
       <p className="cap">
-        Daily render cap is <strong>8</strong>. The starter grid writes drafts only.
+        Daily render cap is <strong>{renderCap}</strong>. The starter grid writes drafts only, at{" "}
+        <strong>{starterSeconds}</strong> seconds.
       </p>
+      {kind === "platform_payout" && platform === "tiktok" ? (
+        <p>TikTok Creator Rewards needs a video longer than 60 seconds, so these drafts are 75 seconds.</p>
+      ) : null}
       {catalogMissing ? (
         <p>No catalog route. Niche, voice, presenter, and hook stay text fields on this form.</p>
       ) : null}
@@ -1410,6 +1622,16 @@ function Catalog({ onBuilt }) {
             ) : null}
           </div>
         </fieldset>
+        <div className="filter">
+          <label htmlFor="draft-length">Draft length in seconds</label>
+          <input
+            id="draft-length"
+            type="number"
+            min="1"
+            value={draftLength}
+            onChange={(event) => setDraftLength(event.target.value)}
+          />
+        </div>
         <div className="actions">
           <button type="button" onClick={addTheme} disabled={Boolean(busy)}>
             Add theme
@@ -1424,6 +1646,10 @@ function Catalog({ onBuilt }) {
             Save experiment draft
           </button>
         </div>
+        <p className="meta">
+          Save experiment draft uses the length above. Build starter grid always writes both styles at{" "}
+          {starterSeconds} seconds.
+        </p>
       </form>
       {created.length > 0 ? (
         <section>
@@ -1488,7 +1714,10 @@ export default function App() {
               <button
                 type="button"
                 aria-current={screen === name ? "page" : undefined}
-                onClick={() => setScreen(name)}
+                onClick={() => {
+                  setScreen(name);
+                  setNotice("");
+                }}
               >
                 {name}
               </button>
