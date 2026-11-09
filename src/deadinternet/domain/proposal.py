@@ -150,6 +150,22 @@ def _money_from(raw: dict) -> Money:
     raise ProposalRejected(f"unknown money path {raw['kind']}")
 
 
+def _with_tracking_suffix(money: Money, suffix: str) -> Money:
+    """Keep two starter drafts from sharing one click code."""
+    if isinstance(money, Affiliate):
+        return Affiliate(tracking_code=f"{money.tracking_code}-{suffix}", merchant=money.merchant)
+    if isinstance(money, OwnOffer):
+        return OwnOffer(tracking_code=f"{money.tracking_code}-{suffix}", offer_url=money.offer_url)
+    return money
+
+
+def _starter_length(money: Money) -> int:
+    """TikTok Creator Rewards cannot be approved at 60 seconds or under."""
+    if isinstance(money, PlatformPayout) and money.platform is Platform.tiktok:
+        return 75
+    return 45
+
+
 def starter_grid(
     niche_ids: list[str],
     money: Money,
@@ -169,7 +185,7 @@ def starter_grid(
             hypothesis=f"Compare styles in {niche_id}",
             script=script_from_beats(beats),
             caption=f"Starter caption for {niche_id}.",
-            length_sec=45,
+            length_sec=_starter_length(money),
             beats=beats,
         )
         drafts.append(
@@ -178,10 +194,11 @@ def starter_grid(
                 **shared,
             )
         )
+        avatar_money = _with_tracking_suffix(money, "avatar")
         drafts.append(
             DraftSpec(
                 style=AvatarStyle(presenter_id=presenter_id, voice_id=voice_id),
-                **shared,
+                **{**shared, "money": avatar_money},
             )
         )
     return drafts

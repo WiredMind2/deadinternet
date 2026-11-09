@@ -226,7 +226,97 @@ def test_publish_duplicate_url_and_manual_url(tmp_path):
         assert posted.status_code == 200
         assert posted.json()["status"] == "posted"
         assert posted.json()["post_url"] == "https://instagram.example/manual/1"
+        listed = client.get("/experiments/exp-manual/publications")
+        assert listed.status_code == 200
+        assert listed.json()[0]["post_url"] == "https://instagram.example/manual/1"
     assert store.get_experiment("exp-manual").status == Status.live
+
+
+def test_short_tiktok_draft_is_refused_and_catalog_records_ids(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    with TestClient(create_app(store)) as client:
+        refused = client.post(
+            "/experiments",
+            json=experiment_body(
+                id="exp-short",
+                length_sec=45,
+                money={"kind": "platform_payout", "platform": "tiktok"},
+            ),
+        )
+        assert refused.status_code == 422
+        created = client.post("/experiments", json=experiment_body())
+        assert created.status_code == 200
+        catalog = client.get("/catalog")
+        assert catalog.status_code == 200
+        body = catalog.json()
+        assert body["niche_ids"] == ["niche-1"]
+        assert body["voice_ids"] == ["voice-1"]
+        assert body["hook_ids"] == ["question"]
+        assert "acme" in body["offer_ids"]
+        assert body["render_cap"] == 8
+        blank = client.post(
+            "/starter",
+            json={
+                "niche_ids": ["niche-1"],
+                "money": {"kind": "affiliate", "tracking_code": "abc", "merchant": "acme"},
+                "hook_id": " ",
+                "voice_id": "voice-1",
+                "presenter_id": "presenter-1",
+            },
+        )
+        assert blank.status_code == 422
+    assert store.get_experiment("exp-1").status == Status.draft
+
+
+def test_tiktok_starter_is_long_enough_to_approve(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    with TestClient(create_app(store)) as client:
+        started = client.post(
+            "/starter",
+            json={
+                "niche_ids": ["niche-1"],
+                "money": {"kind": "platform_payout", "platform": "tiktok"},
+                "hook_id": "question",
+                "voice_id": "voice-1",
+                "presenter_id": "presenter-1",
+            },
+        )
+    assert started.status_code == 200, started.text
+    assert {row["length_sec"] for row in started.json()} == {75}
+    assert "presenter-1" in store.catalog().presenter_ids
+
+
+def test_media_serves_only_files_inside_the_media_dir(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    outside = tmp_path / "secret.mp4"
+    outside.write_bytes(b"secret")
+    store.insert_experiment(experiment(id="exp-out", status=Status.in_review, file_path=str(outside)))
+
+    class _WritingRenderer:
+        def render(self, row, media_dir):
+            from deadinternet.domain.experiment import mark_rendered
+
+            folder = Path(media_dir)
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / f"{row.id}.mp4"
+            target.write_bytes(b"video")
+            return mark_rendered(row, str(target))
+
+    with TestClient(create_app(store, renderer=_WritingRenderer())) as client:
+        hidden = client.get("/media/exp-out")
+        assert hidden.status_code == 404
+        assert client.post("/experiments", json=experiment_body(id="exp-play")).status_code == 200
+        assert client.post("/experiments/exp-play/approve-board").status_code == 200
+        rendered = client.post("/experiments/exp-play/render")
+        assert rendered.status_code == 200
+        played = client.get("/media/exp-play")
+        assert played.status_code == 200
+        assert played.content == b"video"
+        missing = client.get("/media/missing")
+        assert missing.status_code == 404
 
 
 def test_results_report_views_from_the_latest_snapshots(tmp_path):
