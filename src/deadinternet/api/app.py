@@ -9,16 +9,20 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from deadinternet.domain.experiment import (
+    Affiliate,
+    AvatarStyle,
     Beat,
     Experiment,
     IneligibleLength,
     InvalidBoard,
     InvalidTransition,
+    OwnOffer,
     Platform,
+    PlatformPayout,
     Publication,
     PublicationStatus,
     RenderCapReached,
@@ -281,6 +285,7 @@ def create_app(
             "voice_ids": sorted(catalog.voice_ids),
             "hook_ids": sorted(catalog.hook_ids),
             "offer_ids": sorted(catalog.offer_ids),
+            "render_cap": _render_cap(store),
         }
 
     @app.post("/themes")
@@ -320,9 +325,11 @@ def create_app(
             check_segment(experiment.id)
         except (KeyError, ValueError, TypeError, UnsafeId) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _guard_length(experiment)
         path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
         write_storyboard(path, beats)
         store.insert_experiment(experiment)
+        _remember_catalog(store, experiment)
         return _experiment_json(store, experiment)
 
     @app.get("/experiments/{experiment_id}/storyboard")
@@ -454,11 +461,22 @@ def create_app(
     @app.post("/starter")
     def start_grid(body: StarterIn):
         try:
+            _require_text(body.hook_id, "hook_id")
+            _require_text(body.voice_id, "voice_id")
+            _require_text(body.presenter_id, "presenter_id")
+            if not body.niche_ids or any(not str(niche).strip() for niche in body.niche_ids):
+                raise HTTPException(status_code=422, detail="niche_ids is required")
             money = _money_from(body.money)
             niches = [_require_niche(store, niche_id) for niche_id in body.niche_ids]
             drafts = starter_grid(
-                body.niche_ids, money, body.hook_id, body.voice_id, body.presenter_id
+                body.niche_ids,
+                money,
+                body.hook_id.strip(),
+                body.voice_id.strip(),
+                body.presenter_id.strip(),
             )
+        except HTTPException:
+            raise
         except (KeyError, ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         created = []
@@ -468,7 +486,9 @@ def create_app(
             niche = niche_by_id[draft.niche_id]
             path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
             write_storyboard(path, draft.beats)
+            _guard_length(experiment)
             store.insert_experiment(experiment)
+            _remember_catalog(store, experiment)
             created.append(_experiment_json(store, experiment))
         return created
 
@@ -494,6 +514,19 @@ def create_app(
     def create_snapshot(body: SnapshotIn):
         record_snapshot(store, body.publication_id, body.model_dump())
         return {"ok": True}
+
+    @app.get("/experiments/{experiment_id}/publications")
+    def list_experiment_publications(experiment_id: str):
+        _require_experiment(store, experiment_id)
+        return [_publication_json(row) for row in store.list_publications(experiment_id)]
+
+    @app.get("/media/{experiment_id}")
+    def media_file(experiment_id: str):
+        experiment = _require_experiment(store, experiment_id)
+        path = _media_file(store, experiment.file_path)
+        if path is None:
+            raise HTTPException(status_code=404, detail="rendered file is not available")
+        return FileResponse(path, media_type="video/mp4", filename=path.name)
 
     return app
 
@@ -558,6 +591,59 @@ def _views_for(store, experiment_id: str) -> int:
         if snapshots:
             total += int(snapshots[-1]["views"])
     return total
+
+
+def _require_text(value: str, label: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=422, detail=f"{label} is required")
+
+
+def _guard_length(experiment: Experiment) -> None:
+    """A TikTok Creator Rewards draft the lab can never approve is refused now."""
+    if (
+        isinstance(experiment.money, PlatformPayout)
+        and experiment.money.platform is Platform.tiktok
+        and experiment.length_sec <= 60
+    ):
+        raise IneligibleLength("TikTok Creator Rewards videos must be longer than 60 seconds")
+
+
+def _remember_catalog(store, experiment: Experiment) -> None:
+    """Register the ids a new draft uses so suggest can accept them later.
+
+    The niche is deliberately not written: it must already exist, and the
+    experiment's niche_id carries its real theme.
+    """
+    hook = experiment.hook_id.strip()
+    if hook:
+        store.upsert_hook(hook, hook)
+    voice = experiment.style.voice_id.strip()
+    if voice:
+        store.upsert_voice(voice, voice, "local")
+    if isinstance(experiment.style, AvatarStyle):
+        presenter = experiment.style.presenter_id.strip()
+        if presenter:
+            store.upsert_presenter(presenter, presenter, "local")
+    money = experiment.money
+    if isinstance(money, Affiliate):
+        merchant = money.merchant.strip()
+        if merchant:
+            store.upsert_offer(merchant, merchant, f"https://example.test/{merchant}", merchant=merchant)
+    elif isinstance(money, OwnOffer):
+        url = money.offer_url.strip()
+        if url:
+            store.upsert_offer(url, url, url)
+
+
+def _media_file(store, file_path: str | None) -> Path | None:
+    """The rendered file, but only when it lives inside the media directory."""
+    if not file_path:
+        return None
+    path = Path(file_path).resolve()
+    root = _media_dir(store).resolve()
+    if root not in path.parents or not path.is_file():
+        return None
+    return path
 
 
 def _require_publication(store, publication_id: str) -> Publication:

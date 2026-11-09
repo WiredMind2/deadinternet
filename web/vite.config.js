@@ -1,7 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-const api = "http://127.0.0.1:8000";
+const api = process.env.DEADINTERNET_API || "http://127.0.0.1:8000";
 
 export default defineConfig({
   plugins: [react()],
@@ -13,6 +13,7 @@ export default defineConfig({
       "/suggest": { target: api },
       "/publications": { target: api },
       "/snapshots": { target: api },
+      "/media": { target: api },
       "/catalog": { target: api },
       "/themes": { target: api },
       "/niches": { target: api },

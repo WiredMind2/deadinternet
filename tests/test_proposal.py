@@ -114,6 +114,22 @@ def test_two_niches_score_as_different_cells():
     assert cell_size(rows, second) == 1
 
 
+def test_suggest_without_a_presenter_is_a_clear_refusal():
+    parent = _parent()
+    catalog = _catalog(presenter_ids=frozenset(), parents={parent.id: parent})
+    with pytest.raises(ProposalRejected, match="presenter"):
+        suggest([parent], catalog)
+
+
+def test_tiktok_starter_grid_is_longer_than_a_minute():
+    from deadinternet.domain.experiment import Platform, PlatformPayout
+
+    money = PlatformPayout(platform=Platform.tiktok)
+    drafts = starter_grid(["niche-1"], money, "question", "voice-1", "presenter-1")
+    assert drafts
+    assert all(draft.length_sec > 60 for draft in drafts)
+
+
 def test_starter_grid_creates_two_drafts_per_niche_without_rendering():
     money = Affiliate(tracking_code="abc", merchant="acme")
     drafts = starter_grid(["niche-1", "niche-2"], money, "question", "voice-1", "presenter-1")
@@ -124,3 +140,5 @@ def test_starter_grid_creates_two_drafts_per_niche_without_rendering():
     assert all(draft.factor_diffs == () for draft in drafts)
     assert all(len(draft.beats) == 1 for draft in drafts)
     assert drafts[0].script == drafts[0].beats[0].spoken
+    codes = {draft.money.tracking_code for draft in drafts}
+    assert codes == {"abc", "abc-avatar"}

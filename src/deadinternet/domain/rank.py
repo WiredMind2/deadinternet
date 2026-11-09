@@ -62,6 +62,8 @@ def _money_key(row: Experiment) -> str:
 
 def _other_style(parent: Experiment, catalog: Catalog):
     if isinstance(parent.style, FacelessStyle):
+        if not catalog.presenter_ids:
+            raise ProposalRejected("catalog has no presenter to switch to")
         presenter_id = sorted(catalog.presenter_ids)[0]
         return AvatarStyle(presenter_id=presenter_id, voice_id=parent.style.voice_id)
     return FacelessStyle(look=Look.stills, voice_id=parent.style.voice_id, caption_style="bold")
