@@ -562,12 +562,16 @@ function RevenuePanel({ experiment, onChanged }) {
   const [ledgerFailed, setLedgerFailed] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const [reversing, setReversing] = useState(null);
+  const [reverseNote, setReverseNote] = useState("");
 
   useEffect(() => {
     let cancelled = false;
     setLedger(null);
     setLedgerFailed(false);
     setError("");
+    setReversing(null);
+    setReverseNote("");
     api(`/experiments/${encodeURIComponent(experiment.id)}/revenue`)
       .then((data) => {
         if (!cancelled) setLedger(unwrapList(data));
@@ -617,6 +621,37 @@ function RevenuePanel({ experiment, onChanged }) {
     }
   }
 
+  async function reverseEntry(entry) {
+    const reason = String(reverseNote ?? "").trim();
+    if (!reason) {
+      setError("A reversal needs a note explaining the mistake.");
+      return;
+    }
+    setBusy("reverse");
+    setError("");
+    try {
+      await api(
+        `/experiments/${encodeURIComponent(experiment.id)}/revenue/${encodeURIComponent(entry.id)}/reverse`,
+        { method: "POST", body: JSON.stringify({ note: reason }) },
+      );
+      setReversing(null);
+      setReverseNote("");
+      await loadLedger();
+      await onChanged(`Reversed entry ${entry.id} (${entry.amount_cents} cents) for ${experiment.id}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  // Which payout each reversal corrects, so a reversed row can say so.
+  const reversedBy = new Map(
+    (ledger ?? [])
+      .filter((entry) => entry && entry.reverses_entry_id != null)
+      .map((entry) => [entry.reverses_entry_id, entry.id]),
+  );
+
   return (
     <form onSubmit={recordPayout}>
       <fieldset>
@@ -661,6 +696,7 @@ function RevenuePanel({ experiment, onChanged }) {
                   <th scope="col">amount_cents</th>
                   <th scope="col">note</th>
                   <th scope="col">created_at</th>
+                  <th scope="col">reversal</th>
                 </tr>
               </thead>
               <tbody>
@@ -669,6 +705,59 @@ function RevenuePanel({ experiment, onChanged }) {
                     <td>{show(entry.amount_cents)}</td>
                     <td>{show(entry.note)}</td>
                     <td>{show(entry.created_at)}</td>
+                    <td>
+                      {entry.reverses_entry_id != null ? (
+                        <span className="meta">reverses #{entry.reverses_entry_id}</span>
+                      ) : reversedBy.has(entry.id) ? (
+                        <span className="meta">reversed by #{reversedBy.get(entry.id)}</span>
+                      ) : Number(entry.amount_cents) > 0 ? (
+                        reversing === entry.id ? (
+                          <>
+                            <input
+                              type="text"
+                              value={reverseNote}
+                              placeholder="why it was mis-entered"
+                              aria-label={`Reversal note for entry ${entry.id}`}
+                              onChange={(event) => setReverseNote(event.target.value)}
+                              onKeyDown={(event) => {
+                                // Enter must confirm the reversal, not submit
+                                // the payout form this row lives in.
+                                if (event.key === "Enter") {
+                                  event.preventDefault();
+                                  reverseEntry(entry);
+                                }
+                              }}
+                              spellCheck={false}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => reverseEntry(entry)}
+                              disabled={Boolean(busy)}
+                            >
+                              Reverse it
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReversing(null);
+                                setReverseNote("");
+                              }}
+                              disabled={Boolean(busy)}
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setReversing(entry.id)}
+                            disabled={Boolean(busy)}
+                          >
+                            Reverse
+                          </button>
+                        )
+                      ) : null}
+                    </td>
                   </tr>
                 ))}
               </tbody>

@@ -665,6 +665,137 @@ def test_a_failed_ledger_insert_rolls_the_total_back(tmp_path):
     assert store.list_revenue_entries("exp-1") == []
 
 
+def test_reverse_revenue_lowers_the_total_and_links_the_rows(tmp_path):
+    """US-037: a reversal writes one negative row that points back at the
+    entry it corrects, and the total drops by the reversed amount."""
+    store = _store(tmp_path / "lab.sqlite")
+    face = _faceless(revenue_cents=0)
+    store.insert_experiment(face)
+    original = store.record_revenue(face.id, 250, "tiktok", "2026-11-19T00:00:00Z")
+    store.record_revenue(face.id, 100, "", "2026-11-19T00:05:00Z")
+
+    reversal = store.reverse_revenue(face.id, original["id"], "typo", "2026-11-19T00:10:00Z")
+
+    assert store.get_experiment(face.id).revenue_cents == 100
+    entries = store.list_revenue_entries(face.id)
+    assert [entry["id"] for entry in entries] == [reversal["id"], 2, original["id"]]
+    assert entries[0]["amount_cents"] == -250
+    assert entries[0]["reverses_entry_id"] == original["id"]
+    assert entries[0]["note"] == "typo"
+    assert entries[2]["amount_cents"] == 250
+    assert entries[2]["reverses_entry_id"] is None
+
+
+def test_reverse_revenue_refuses_double_reversals_and_reversals_of_reversals(tmp_path):
+    """US-037: one reversal per payout. The refusal names the reversal
+    that already corrected the entry, and nothing changes on refusal."""
+    store = _store(tmp_path / "lab.sqlite")
+    face = _faceless(revenue_cents=0)
+    store.insert_experiment(face)
+    original = store.record_revenue(face.id, 250, "tiktok", "2026-11-19T00:00:00Z")
+
+    first = store.reverse_revenue(face.id, original["id"], "typo", "2026-11-19T00:10:00Z")
+    with pytest.raises(ValueError, match=f"already reversed by entry {first['id']}"):
+        store.reverse_revenue(face.id, original["id"], "again", "2026-11-19T00:15:00Z")
+    with pytest.raises(ValueError, match="is a reversal, not a payout"):
+        store.reverse_revenue(face.id, first["id"], "undo the undo", "2026-11-19T00:20:00Z")
+
+    with pytest.raises(KeyError):
+        store.reverse_revenue(face.id, 999, "no such row", "2026-11-19T00:25:00Z")
+    with pytest.raises(KeyError):
+        store.reverse_revenue("exp-missing", original["id"], "no such experiment", "2026-11-19T00:30:00Z")
+
+    assert store.get_experiment(face.id).revenue_cents == 0
+    assert len(store.list_revenue_entries(face.id)) == 2
+
+
+def test_reverse_revenue_never_takes_the_total_below_zero(tmp_path):
+    """US-037: the guard defends a counter a ledger row no longer matches
+    (a counter-only adjustment can leave one behind); the refused reversal
+    leaves the total and the ledger exactly as they were."""
+    store = _store(tmp_path / "lab.sqlite")
+    face = _faceless(revenue_cents=0)
+    store.insert_experiment(face)
+    original = store.record_revenue(face.id, 250, "tiktok", "2026-11-19T00:00:00Z")
+    store.add_revenue(face.id, -200)
+
+    with pytest.raises(ValueError, match="below 0"):
+        store.reverse_revenue(face.id, original["id"], "typo", "2026-11-19T00:10:00Z")
+    assert store.get_experiment(face.id).revenue_cents == 50
+    assert len(store.list_revenue_entries(face.id)) == 1
+
+
+def test_a_failed_reversal_insert_rolls_the_total_back(tmp_path):
+    """US-037: the total and the reversal row are one transaction. A
+    trigger aborts the reversal insert; the lowered total must roll back
+    with it."""
+    store = _store(tmp_path / "lab.sqlite")
+    store.insert_experiment(experiment(id="exp-1"))
+    original = store.record_revenue("exp-1", 250, "tiktok", "2026-11-19T00:00:00Z")
+    store._conn.execute(
+        "CREATE TRIGGER no_reversal BEFORE INSERT ON revenue_ledger "
+        "BEGIN SELECT RAISE(ABORT, 'boom'); END"
+    )
+    with pytest.raises(sqlite3.Error, match="boom"):
+        store.reverse_revenue("exp-1", original["id"], "typo", "2026-11-19T00:10:00Z")
+    assert store.get_experiment("exp-1").revenue_cents == 250
+    assert [entry["id"] for entry in store.list_revenue_entries("exp-1")] == [original["id"]]
+
+
+def test_legacy_ledger_upgrades_with_the_reversal_link(tmp_path):
+    """US-037: a legacy database whose ledger has no reverses_entry_id
+    upgrades cleanly. Old rows read back with no link, and a reversal
+    written afterwards round-trips. Re-opening is a no-op."""
+    path = tmp_path / "legacy-reversals.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE niches (id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL)")
+    conn.execute("INSERT INTO niches (id, name, language) VALUES ('history', 'History', 'en')")
+    conn.execute(_LEGACY_EXPERIMENTS_SCHEMA)
+    conn.execute(
+        """
+        CREATE TABLE revenue_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO experiments (
+            id, niche_id, hypothesis, hook_id, script, caption, style_json, money_json,
+            status, length_sec, measurement_window_days, language, revenue_cents
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        _legacy_row("exp-old", "abc")[:12] + (250,),
+    )
+    conn.execute(
+        """
+        INSERT INTO revenue_ledger (experiment_id, amount_cents, note, created_at)
+        VALUES ('exp-old', 250, 'tiktok', '2026-11-01T00:00:00Z')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = _store(path)
+    entries = store.list_revenue_entries("exp-old")
+    assert len(entries) == 1
+    assert entries[0]["reverses_entry_id"] is None
+
+    reversal = store.reverse_revenue("exp-old", entries[0]["id"], "typo", "2026-11-19T00:00:00Z")
+    assert store.get_experiment("exp-old").revenue_cents == 0
+    after = store.list_revenue_entries("exp-old")
+    assert [entry["amount_cents"] for entry in after] == [-250, 250]
+    assert after[0]["reverses_entry_id"] == reversal["reverses_entry_id"] == entries[0]["id"]
+
+    reopened = _store(path)
+    assert reopened.get_experiment("exp-old").revenue_cents == 0
+    assert [entry["amount_cents"] for entry in reopened.list_revenue_entries("exp-old")] == [-250, 250]
+
+
 def test_a_failed_click_log_insert_rolls_the_counter_back(tmp_path):
     """US-025: the counter and the log are one transaction. A trigger
     aborts the log insert; the counter must roll back with it."""

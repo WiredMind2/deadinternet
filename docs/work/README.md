@@ -38,10 +38,10 @@ index and `archive/` before minting a new one.
 | US-031 | Accepted drafts keep their parent and factor list | 3 | Done |
 | US-032 | Faceless stills render speaks each beat | 5 | Done |
 | US-033 | Burned-in captions from beat on-screen text | 3 | Done |
-| US-034 | Public read-only click app | 3 | Ready |
+| US-034 | Public read-only click app | 3 | Done |
 | US-035 | The window starts at the first post, on the server clock | 2 | Ready |
 | US-036 | Money paths are scored apart | 3 | Ready |
-| US-037 | Correct a payout with a reversal | 2 | Ready |
+| US-037 | Correct a payout with a reversal | 2 | Done |
 | US-038 | Snapshots honest about gaps | 2 | Ready |
 | US-039 | Show which legacy codes the migration renamed | 1 | Ready |
 | US-040 | The Post tab never hides the live publication behind a stale one | 1 | Ready |
@@ -105,9 +105,15 @@ mirroring the avatar stub, verified against real ffmpeg on this
 machine). Caveat: no TTS provider is wired, so a live faceless render
 lands `render_failed` naming `DEADINTERNET_TTS_API_KEY` until an
 operator supplies a real speaker; the pipeline itself is verified with a
-synthetic one. Remaining backlog: US-034 (public read-only /r/ click
-app), US-035 (window anchored to the first post, server clock), US-036
-(money paths scored apart), US-037 (payout reversals), US-038 (absent vs
+synthetic one. US-037 (payout reversals: a linked ledger row with a
+required note, one transaction, the total never below zero, double
+reversal refused, an inline Reverse affordance in the dashboard) and
+US-034 (the public read-only click app: `python -m deadinternet
+--public [port]` serves only `GET /r/{code}` on its own process against
+the same lab database, with every admin route 404 and no store detail
+leaking; the admin app keeps its /r route for local dev) also landed the
+same day. Remaining backlog: US-035 (window anchored to the first post,
+server clock), US-036 (money paths scored apart), US-038 (absent vs
 zero snapshots), US-039 (migration renames surfaced), US-040 (stale
 publication on Post). Explicitly deferred per the reflexion:
 auto-posting clients, the avatar provider, a smarter LLM proposer,

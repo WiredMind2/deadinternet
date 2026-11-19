@@ -139,7 +139,8 @@ CREATE TABLE IF NOT EXISTS revenue_ledger (
     experiment_id TEXT NOT NULL,
     amount_cents INTEGER NOT NULL,
     note TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    reverses_entry_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS revenue_ledger_experiment ON revenue_ledger (experiment_id);
@@ -338,6 +339,7 @@ class Store:
         self._ensure_lineage()
         self._ensure_unique_tracking_codes()
         self._ensure_click_log()
+        self._ensure_reversal_link()
 
     def _ensure_click_log(self) -> None:
         """US-025: the counter and the log must agree. Clicks recorded before
@@ -418,6 +420,16 @@ class Store:
             self._conn.commit()
         if "factor_diffs_json" not in columns:
             self._conn.execute("ALTER TABLE experiments ADD COLUMN factor_diffs_json TEXT")
+            self._conn.commit()
+
+    def _ensure_reversal_link(self) -> None:
+        """US-037: ledger rows saved before reversals existed read back
+        with no link. Idempotent."""
+        columns = self._column_names("revenue_ledger")
+        if not columns:
+            return
+        if "reverses_entry_id" not in columns:
+            self._conn.execute("ALTER TABLE revenue_ledger ADD COLUMN reverses_entry_id INTEGER")
             self._conn.commit()
 
     def _ensure_unique_tracking_codes(self) -> None:
@@ -919,10 +931,78 @@ class Store:
             "created_at": created_at,
         }
 
+    def reverse_revenue(
+        self, experiment_id: str, entry_id: int, note: str, created_at: str
+    ) -> dict:
+        """Lower the total and append one linked reversal row in a single
+        transaction (US-037). The reversal carries the original amount as a
+        negative number and points back at the entry it corrects. One entry
+        is reversed at most once, and the total never drops below 0. Two
+        separate commits could leave the total lowered with no reversal row
+        behind it; here both land or neither does."""
+        self._require_experiment(experiment_id)
+        original = self._conn.execute(
+            """
+            SELECT id, amount_cents
+            FROM revenue_ledger
+            WHERE id = ? AND experiment_id = ?
+            """,
+            (int(entry_id), experiment_id),
+        ).fetchone()
+        if original is None:
+            raise KeyError(entry_id)
+        amount = int(original["amount_cents"])
+        if amount <= 0:
+            raise ValueError(f"entry {entry_id} is a reversal, not a payout")
+        reversal = self._conn.execute(
+            """
+            SELECT id FROM revenue_ledger
+            WHERE experiment_id = ? AND reverses_entry_id = ?
+            """,
+            (experiment_id, int(entry_id)),
+        ).fetchone()
+        if reversal is not None:
+            raise ValueError(f"entry {entry_id} is already reversed by entry {reversal['id']}")
+        total = self._conn.execute(
+            "SELECT revenue_cents FROM experiments WHERE id = ?",
+            (experiment_id,),
+        ).fetchone()
+        remaining = int(total["revenue_cents"])
+        if amount > remaining:
+            raise ValueError(
+                f"the total is {remaining} cents; reversing entry {entry_id} "
+                f"({amount} cents) would take it below 0"
+            )
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE experiments
+                SET revenue_cents = revenue_cents - ?
+                WHERE id = ?
+                """,
+                (amount, experiment_id),
+            )
+            cur = self._conn.execute(
+                """
+                INSERT INTO revenue_ledger (
+                    experiment_id, amount_cents, note, created_at, reverses_entry_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (experiment_id, -amount, note or "", created_at, int(entry_id)),
+            )
+        return {
+            "id": int(cur.lastrowid),
+            "experiment_id": experiment_id,
+            "amount_cents": -amount,
+            "note": note or "",
+            "created_at": created_at,
+            "reverses_entry_id": int(entry_id),
+        }
+
     def list_revenue_entries(self, experiment_id: str) -> list[dict]:
         rows = self._conn.execute(
             """
-            SELECT id, experiment_id, amount_cents, note, created_at
+            SELECT id, experiment_id, amount_cents, note, created_at, reverses_entry_id
             FROM revenue_ledger
             WHERE experiment_id = ?
             ORDER BY id DESC

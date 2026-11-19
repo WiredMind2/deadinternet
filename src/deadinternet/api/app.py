@@ -224,6 +224,12 @@ class RevenueIn(BaseModel):
     note: str = ""
 
 
+class ReversalIn(BaseModel):
+    # The operator must say what went wrong; a silent correction is a
+    # second unexplained edit of the money column (US-037).
+    note: str
+
+
 class _ThreadSafeStore:
     """Serialize store calls and let FastAPI's worker threads use the file.
 
@@ -657,6 +663,9 @@ def create_app(
 
     @app.get("/r/{code}")
     def redirect_click(code: str):
+        # Local dev convenience only (US-034): the public click app
+        # (python -m deadinternet --public) is the one to expose to the
+        # open internet; it mounts no admin routes at all.
         try:
             _count, destination = hit(store, code)
         except KeyError as exc:
@@ -697,6 +706,26 @@ def create_app(
     def list_revenue(experiment_id: str):
         _require_experiment(store, experiment_id)
         return store.list_revenue_entries(experiment_id)
+
+    @app.post("/experiments/{experiment_id}/revenue/{entry_id}/reverse")
+    def reverse_revenue(experiment_id: str, entry_id: int, body: ReversalIn):
+        experiment = _require_experiment(store, experiment_id)
+        _require_text(body.note, "note")
+        try:
+            entry = store.reverse_revenue(
+                experiment.id, entry_id, body.note.strip(), _now()
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"unknown ledger entry {entry_id}") from exc
+        except ValueError as exc:
+            # A refusal names the state that blocked it: the entry is
+            # already reversed, is itself a reversal, or the reversal
+            # would take the total below 0.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "entry": entry,
+            "revenue_cents": store.get_experiment(experiment.id).revenue_cents,
+        }
 
     @app.get("/publications/{publication_id}/snapshots")
     def list_publication_snapshots(publication_id: str):
