@@ -134,15 +134,24 @@ operator loop for these five was re-verified in the browser on a temp
 lab, including the stale-publication pick, the window-end display on
 Board and Post, the "—" snapshot cells beside legacy measured zeros, the
 per-path revenue totals, the settles-after-the-window marks on Results
-and Proposals, and the rename banner's dismiss-and-return lifecycle.
-Known pre-existing (not from this landing): four end-of-session
-ResourceWarnings from the two test_store tests that construct Store
-directly instead of the registered `_store` helper. Explicitly deferred
-per the reflexion:
-auto-posting clients, the avatar provider, a smarter LLM proposer,
-bandit statistics, stock-footage clips, splitting App.jsx, an ORM, a
-scheduler. The cell not controlling for hook and length (review finding
-G6) can now be revisited on the stored lineage.
+and Proposals, and the rename banner's dismiss-and-return lifecycle. The
+four ResourceWarnings the landing noted (test_store tests constructing
+Store directly) were closed in the same session — every test store now
+registers with the conftest cleanup, verified with warnings-as-errors.
+Explicitly deferred per the reflexion: auto-posting clients, the avatar
+provider, a smarter LLM proposer, bandit statistics, stock-footage
+clips, splitting App.jsx, an ORM, a scheduler. The cell not controlling
+for hook and length (review finding G6) can now be revisited on the
+stored lineage.
+
+The local backlog is closed as of 2026-11-19: every story in this index
+is Done, the suite stands at 288 passing with 95.5% coverage, and the
+build is green. What remains needs the operator, not more local code: a
+real TTS speaker behind `DEADINTERNET_TTS_API_KEY` (the render pipeline
+is verified with a synthetic one and fails loudly without it), an avatar
+provider behind `AVATAR_API_KEY` (same env-gated pattern), and platform
+credentials before any auto-posting client — all deliberately deferred
+in the backlog above.
 
 ## Collisions
 

@@ -110,7 +110,7 @@ def _by_id(rows: list[Experiment]) -> dict[str, Experiment]:
 
 def test_round_trip_faceless_affiliate_and_avatar_own_offer(tmp_path):
     path = str(tmp_path / "lab.sqlite")
-    store = Store(path)
+    store = _store(path)
     face = _faceless()
     avatar = _avatar()
     payout = _payout()
@@ -149,7 +149,7 @@ def test_round_trip_faceless_affiliate_and_avatar_own_offer(tmp_path):
     assert kept.clicks == face.clicks
     assert kept.revenue_cents == face.revenue_cents
 
-    reopened = Store(path)
+    reopened = _store(path)
     assert reopened.get_experiment(face.id) == edited
     assert reopened.get_experiment(avatar.id) == avatar
     assert reopened.get_experiment(payout.id) == payout
@@ -266,7 +266,7 @@ def test_renders_started_today_counts_only_that_day(tmp_path):
 
 def test_add_click_matches_affiliate_or_own_offer_tracking_code(tmp_path):
     path = str(tmp_path / "lab.sqlite")
-    store = Store(path)
+    store = _store(path)
     face = _faceless(clicks=0, revenue_cents=0)
     avatar = _avatar(clicks=0, revenue_cents=0)
     payout = _payout()
@@ -293,7 +293,7 @@ def test_add_click_matches_affiliate_or_own_offer_tracking_code(tmp_path):
         store.add_click("missing-code")
     assert store.get_experiment(face.id).clicks == 2
 
-    reopened = Store(path)
+    reopened = _store(path)
     assert reopened.get_experiment(face.id).clicks == 2
     assert reopened.get_experiment(avatar.id).clicks == 1
     assert reopened.get_experiment(payout.id).clicks == 0
