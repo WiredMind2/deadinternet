@@ -88,8 +88,11 @@ def test_missing_token_yields_manual_pack(token):
     assert result.publication.account_id == "acct-ig"
     assert result.publication.platform is Platform.instagram
     assert result.manual_pack == ManualPack(
+        experiment_id=experiment.id,
+        account_id="acct-ig",
         file_path=experiment.file_path,
         caption=experiment.caption,
+        script=experiment.script,
         platform=Platform.instagram,
     )
     assert client.calls == []

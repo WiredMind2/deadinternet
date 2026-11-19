@@ -59,8 +59,11 @@ def publish(
                 status=PublicationStatus.manual_needed,
             ),
             manual_pack=ManualPack(
+                experiment_id=experiment.id,
+                account_id=account_id,
                 file_path=experiment.file_path,
                 caption=experiment.caption,
+                script=experiment.script,
                 platform=platform,
             ),
         )

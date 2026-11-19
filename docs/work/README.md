@@ -16,6 +16,11 @@ index and `archive/` before minting a new one.
 | US-007 | Accept or discard each suggested draft on its own | 3 | Done |
 | US-008 | Recover the vendor-ig-tools proposer lint work onto main, then remove that worktree | 3 | Done |
 | US-009 | Gate proposed drafts with vendored hook, caption, and phrase lints | 5 | Done |
+| US-010 | Refuse a conflicting theme or niche re-creation | 2 | Done |
+| US-011 | Send affiliate clicks to a real, operator-set offer URL | 5 | Done |
+| US-012 | Include script and ids in the manual publish pack | 2 | Done |
+| US-013 | Tell the operator when copying the tracking link failed | 1 | Done |
+| US-014 | Record dashboard setup and the Python 3.14 warning; restore the archive dir | 1 | Done |
 
 ## Collisions
 

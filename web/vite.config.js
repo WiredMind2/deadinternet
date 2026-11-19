@@ -17,6 +17,7 @@ export default defineConfig({
       "/catalog": { target: api },
       "/themes": { target: api },
       "/niches": { target: api },
+      "/offers": { target: api },
       "/r": { target: api },
     },
   },

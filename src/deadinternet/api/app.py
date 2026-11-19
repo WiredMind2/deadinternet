@@ -155,6 +155,13 @@ class NicheIn(BaseModel):
     name: str
 
 
+class OfferIn(BaseModel):
+    id: str
+    url: str
+    name: str | None = None
+    merchant: str = ""
+
+
 class StoryboardIn(BaseModel):
     beats: list[dict[str, Any]]
 
@@ -294,6 +301,12 @@ def create_app(
             check_segment(body.id)
         except UnsafeId as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        existing = store.get_theme(body.id)
+        if existing is not None and (existing.name, existing.language) != (body.name, body.language):
+            raise HTTPException(
+                status_code=409,
+                detail=f"theme {body.id} already exists as {existing.name}/{existing.language}",
+            )
         store.upsert_theme(body.id, body.name, body.language)
         theme = store.get_theme(body.id)
         return {"id": theme.id, "name": theme.name, "language": theme.language}
@@ -307,9 +320,28 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if store.get_theme(body.theme_id) is None:
             raise HTTPException(status_code=422, detail=f"unknown theme {body.theme_id}")
+        existing = store.get_niche(body.id)
+        if existing is not None and (existing.theme_id, existing.name) != (body.theme_id, body.name):
+            raise HTTPException(
+                status_code=409,
+                detail=f"niche {body.id} already exists under theme {existing.theme_id}",
+            )
         store.upsert_niche(body.id, body.theme_id, body.name)
         niche = store.get_niche(body.id)
         return {"id": niche.id, "theme_id": niche.theme_id, "name": niche.name}
+
+    @app.post("/offers")
+    def create_offer(body: OfferIn):
+        try:
+            check_segment(body.id)
+        except UnsafeId as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        url = body.url.strip()
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=422, detail="offer url must start with http:// or https://")
+        store.upsert_offer(body.id, body.name or body.id, url, body.merchant or body.id)
+        offer = store.get_offer(body.id)
+        return {"id": offer["id"], "name": offer["name"], "url": offer["url"], "merchant": offer["merchant"]}
 
     @app.get("/experiments")
     def get_experiments():
@@ -506,8 +538,8 @@ def create_app(
     def redirect_click(code: str):
         try:
             _count, destination = hit(store, code)
-        except KeyError:
-            raise HTTPException(status_code=404, detail="unknown tracking code") from None
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc) or "unknown tracking code") from None
         return RedirectResponse(url=destination, status_code=302)
 
     @app.post("/snapshots")
@@ -628,7 +660,7 @@ def _remember_catalog(store, experiment: Experiment) -> None:
     if isinstance(money, Affiliate):
         merchant = money.merchant.strip()
         if merchant:
-            store.upsert_offer(merchant, merchant, f"https://example.test/{merchant}", merchant=merchant)
+            store.upsert_offer(merchant, merchant, "", merchant=merchant)
     elif isinstance(money, OwnOffer):
         url = money.offer_url.strip()
         if url:

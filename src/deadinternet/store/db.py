@@ -404,16 +404,23 @@ class Store:
         )
 
     def upsert_offer(self, id: str, name: str, url: str, merchant: str = "") -> None:
+        # An empty url never erases a url an operator already saved.
         self._write(
             """
             INSERT INTO offers (id, name, url, merchant) VALUES (?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
-                url = excluded.url,
+                url = CASE WHEN excluded.url = '' THEN offers.url ELSE excluded.url END,
                 merchant = excluded.merchant
             """,
             (id, name, url, merchant),
         )
+
+    def get_offer(self, id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT id, name, url, merchant FROM offers WHERE id = ?", (id,)
+        ).fetchone()
+        return dict(row) if row else None
 
     def upsert_account(self, id: str, platform: Platform | str, handle: str) -> None:
         self._write(

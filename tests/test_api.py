@@ -88,14 +88,78 @@ def test_tiktok_rewards_under_a_minute_cannot_be_approved(tmp_path):
 
 def test_redirect_records_one_experiments_click(tmp_path):
     store = open_store(tmp_path)
+    store.upsert_offer("acme", "Acme", "https://acme.test/deal", merchant="acme")
     store.insert_experiment(experiment(id="exp-a", money=Affiliate(tracking_code="code-a", merchant="acme")))
     store.insert_experiment(experiment(id="exp-b", money=Affiliate(tracking_code="code-b", merchant="other")))
     with TestClient(create_app(store)) as client:
         response = client.get("/r/code-a", follow_redirects=False)
     assert response.status_code == 302
-    assert response.headers["location"] == "https://example.test/acme"
+    assert response.headers["location"] == "https://acme.test/deal"
     assert store.get_experiment("exp-a").clicks == 1
     assert store.get_experiment("exp-b").clicks == 0
+
+
+def test_offer_url_saved_through_the_api_redirects_affiliate_clicks(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    store.insert_experiment(experiment(id="exp-a", money=Affiliate(tracking_code="code-a", merchant="acme")))
+    with TestClient(create_app(store)) as client:
+        saved = client.post(
+            "/offers",
+            json={"id": "acme", "url": "https://acme.example/deal"},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["url"] == "https://acme.example/deal"
+        response = client.get("/r/code-a", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://acme.example/deal"
+    assert store.get_experiment("exp-a").clicks == 1
+
+
+def test_affiliate_click_without_a_saved_offer_url_returns_404(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    store.insert_experiment(experiment(id="exp-a", money=Affiliate(tracking_code="code-a", merchant="acme")))
+    with TestClient(create_app(store)) as client:
+        response = client.get("/r/code-a", follow_redirects=False)
+    assert response.status_code == 404
+    assert "acme" in response.json()["detail"]
+    assert store.get_experiment("exp-a").clicks == 0
+
+
+def test_offer_url_must_be_http(tmp_path):
+    store = open_store(tmp_path)
+    with TestClient(create_app(store)) as client:
+        response = client.post("/offers", json={"id": "acme", "url": "ftp://acme.example"})
+    assert response.status_code == 422
+
+
+def test_conflicting_theme_recreation_is_refused(tmp_path):
+    store = open_store(tmp_path)
+    with TestClient(create_app(store)) as client:
+        first = client.post("/themes", json={"id": "history", "name": "History", "language": "en"})
+        assert first.status_code == 200
+        same = client.post("/themes", json={"id": "history", "name": "History", "language": "en"})
+        assert same.status_code == 200
+        conflict = client.post("/themes", json={"id": "history", "name": "Past", "language": "fr"})
+        assert conflict.status_code == 409
+    theme = store.get_theme("history")
+    assert (theme.name, theme.language) == ("History", "en")
+
+
+def test_conflicting_niche_recreation_is_refused(tmp_path):
+    store = open_store(tmp_path)
+    with TestClient(create_app(store)) as client:
+        created = client.post("/themes", json={"id": "history", "name": "History", "language": "en"})
+        assert created.status_code == 200
+        first = client.post("/niches", json={"id": "war", "theme_id": "history", "name": "War"})
+        assert first.status_code == 200
+        conflict = client.post("/niches", json={"id": "war", "theme_id": "history", "name": "Peace"})
+        assert conflict.status_code == 409
+        moved = client.post("/niches", json={"id": "war", "theme_id": "history", "name": "War"})
+        assert moved.status_code == 200
+    niche = store.get_niche("war")
+    assert (niche.theme_id, niche.name) == ("history", "War")
 
 
 def test_suggest_does_not_create_a_video_file(tmp_path):
@@ -218,6 +282,9 @@ def test_publish_duplicate_url_and_manual_url(tmp_path):
         assert manual.status_code == 200
         assert manual.json()["status"] == "manual_needed"
         assert manual.json()["manual_pack"]["caption"] == "Watch this."
+        assert manual.json()["manual_pack"]["experiment_id"] == "exp-manual"
+        assert manual.json()["manual_pack"]["account_id"] == "acct-1"
+        assert manual.json()["manual_pack"]["script"] == "Here is the spoken script."
         assert store.get_experiment("exp-manual").status == Status.approved
         posted = client.post(
             f"/publications/{manual.json()['id']}/url",

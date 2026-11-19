@@ -279,6 +279,13 @@ def test_catalog_lists_ids_and_every_experiment(tmp_path):
     assert {"offer-1", "https://shop.example/offer", "acme"} <= catalog.offer_ids
     assert catalog.parents == {face.id: face, avatar.id: avatar}
 
+    # A remembered merchant (empty url) never erases an operator-saved url.
+    store.upsert_offer("offer-1", "Acme mat", "", merchant="acme")
+    assert store.get_offer("offer-1")["url"] == "https://shop.example/offer"
+    store.upsert_offer("offer-1", "Acme mat", "https://shop.example/new", merchant="acme")
+    assert store.get_offer("offer-1")["url"] == "https://shop.example/new"
+    assert store.get_offer("missing") is None
+
     assert store.get_setting("daily_render_cap", 8) == 8
     store.set_setting("daily_render_cap", 8)
     store.set_setting("daily_render_cap", 6)

@@ -238,14 +238,17 @@ function Facts({ rows }) {
 
 function TrackingLink({ code }) {
   const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
   const url = `${window.location.origin}/r/${code}`;
 
   async function copy() {
+    setFailed(false);
     try {
       await navigator.clipboard.writeText(url);
       setCopied(true);
     } catch {
       setCopied(false);
+      setFailed(true);
     }
   }
 
@@ -255,7 +258,8 @@ function TrackingLink({ code }) {
       <button type="button" onClick={copy} aria-label={`Copy tracking link ${url}`}>
         {copied ? "Copied" : "Copy"}
       </button>
-      {!copied ? null : <span role="status">Link copied to the clipboard.</span>}
+      {copied ? <span role="status">Link copied to the clipboard.</span> : null}
+      {failed ? <span role="alert">Copy failed. Select the link text and copy it by hand.</span> : null}
     </span>
   );
 }
@@ -1404,6 +1408,29 @@ function Catalog({ onBuilt }) {
     }
   }
 
+  async function saveOffer() {
+    const merchantId = merchant.trim();
+    const url = offerUrl.trim();
+    if (!merchantId || !url) {
+      setError("Enter a merchant id and the offer URL its tracking links should open.");
+      return;
+    }
+    setBusy("offer");
+    setError("");
+    try {
+      await api("/offers", {
+        method: "POST",
+        body: JSON.stringify({ id: merchantId, url }),
+      });
+      await loadCatalog();
+      await onBuilt(`Saved offer URL for ${merchantId}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function saveExperimentDraft() {
     const niches = splitIds(nicheIds);
     if (niches.length === 0 || !hookId.trim() || !voiceId.trim()) {
@@ -1622,6 +1649,34 @@ function Catalog({ onBuilt }) {
             ) : null}
           </div>
         </fieldset>
+        <fieldset>
+          <legend>Offer</legend>
+          <div className="filters">
+            <div className="filter">
+              <label htmlFor="offer-merchant">merchant</label>
+              <input
+                id="offer-merchant"
+                type="text"
+                value={merchant}
+                onChange={(event) => setMerchant(event.target.value)}
+                spellCheck={false}
+              />
+            </div>
+            <div className="filter">
+              <label htmlFor="offer-link">offer URL</label>
+              <input
+                id="offer-link"
+                type="url"
+                value={offerUrl}
+                onChange={(event) => setOfferUrl(event.target.value)}
+              />
+            </div>
+          </div>
+          <p className="meta">
+            Affiliate tracking links redirect to the saved offer URL. Until one is saved, those
+            links answer 404 instead of sending clicks somewhere fake.
+          </p>
+        </fieldset>
         <div className="filter">
           <label htmlFor="draft-length">Draft length in seconds</label>
           <input
@@ -1638,6 +1693,9 @@ function Catalog({ onBuilt }) {
           </button>
           <button type="button" onClick={addNiche} disabled={Boolean(busy)}>
             Add niche
+          </button>
+          <button type="button" onClick={saveOffer} disabled={busy === "offer"}>
+            Save offer URL
           </button>
           <button type="submit" disabled={busy === "starter"}>
             Build starter grid
