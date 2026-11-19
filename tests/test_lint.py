@@ -2,7 +2,14 @@
 
 from deadinternet.domain.experiment import Affiliate, AvatarStyle, Status
 from deadinternet.domain.proposal import DraftSpec
-from deadinternet.propose.lint import caption_problems, draft_problems, score_hook, slop_hits
+from deadinternet.propose.lint import (
+    caption_problems,
+    check_frontload,
+    check_specificity,
+    draft_problems,
+    score_hook,
+    slop_hits,
+)
 
 
 def _draft(script="I lost $18,000 on one missing contract.", caption="That contract cost me $18,000."):
@@ -46,6 +53,34 @@ def test_stock_phrases_are_listed_for_replacement():
 def test_the_hook_score_separates_weak_from_strong():
     weak = score_hook("So today I wanted to show you something.")
     strong = score_hook("I lost $18,000 on one missing contract.")
-    assert weak.verdict in {"WEAK", "OK"}
+    assert weak.verdict == "WEAK"
     assert strong.verdict == "STRONG"
     assert strong.overall > weak.overall
+
+
+def test_a_hook_whose_only_payload_is_a_proper_noun_gets_credit():
+    hook = "The Lyon rental market ate my budget."
+    score = score_hook(hook)
+    assert "payload at word 2" in score.checks["FRONTLOAD"][1]
+    assert "no payload word anywhere" not in score.checks["FRONTLOAD"][1]
+    assert draft_problems(_draft(script=hook)) == []
+
+
+def test_a_capitalized_first_word_is_sentence_case_not_a_name():
+    hook = "Everyone wants the cheap keyboard."
+    assert "no payload word anywhere" in check_frontload(hook)[1]
+    assert "no number, no name" in check_specificity(hook)[1]
+
+
+def test_words_that_begin_like_a_weak_opener_are_not_penalized():
+    hire = check_frontload("Hire the right coach before your first client.")[1]
+    solar = check_frontload("Solar panels paid for themselves in two winters.")[1]
+    assert "weak opener" not in hire
+    assert "weak opener" not in solar
+
+
+def test_genuine_weak_openers_are_still_penalized():
+    so = check_frontload("So I tried the thing everyone warned me about.")[1]
+    hey = check_frontload("Hey, that app owes me forty dollars.")[1]
+    assert 'weak opener "so"' in so
+    assert 'weak opener "hey"' in hey

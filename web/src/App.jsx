@@ -337,6 +337,7 @@ function StoryboardEditor({ experiment, onChanged }) {
   const [beats, setBeats] = useState([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const [loading, setLoading] = useState(true);
 
   function keyed(rows) {
     return rows.map((beat) => ({
@@ -350,12 +351,16 @@ function StoryboardEditor({ experiment, onChanged }) {
   useEffect(() => {
     let cancelled = false;
     setError("");
+    setLoading(true);
     api(`/experiments/${encodeURIComponent(experiment.id)}/storyboard`)
       .then((data) => {
         if (!cancelled) setBeats(keyed(Array.isArray(data.beats) ? data.beats : []));
       })
       .catch((err) => {
         if (!cancelled) setError(errorMessage(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
       });
     return () => {
       cancelled = true;
@@ -432,7 +437,8 @@ function StoryboardEditor({ experiment, onChanged }) {
       <fieldset>
         <legend>Storyboard</legend>
         <Banner>{error}</Banner>
-        {beats.length === 0 ? <p>Add a beat before approving this board.</p> : null}
+        {loading ? <p>Loading the storyboard…</p> : null}
+        {!loading && beats.length === 0 ? <p>Add a beat before approving this board.</p> : null}
         <ol className="stack">
           {beats.map((beat, index) => (
             <li key={beat.key}>
@@ -671,7 +677,7 @@ function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error 
   );
 }
 
-function Review({ experiments, selectedId, onSelect, onChanged }) {
+function Review({ experiments, selectedId, onSelect, onChanged, loadError }) {
   const queue = experiments.filter((row) => row.status === "in_review");
   const selected = queue.find((row) => row.id === selectedId) || queue[0] || null;
   const [busy, setBusy] = useState("");
@@ -682,6 +688,7 @@ function Review({ experiments, selectedId, onSelect, onChanged }) {
 
   useEffect(() => {
     setVideoBroken(false);
+    setError("");
   }, [selected?.id]);
 
   async function approve() {
@@ -718,8 +725,11 @@ function Review({ experiments, selectedId, onSelect, onChanged }) {
   return (
     <>
       <Banner>{error}</Banner>
+      <Banner>{loadError}</Banner>
       {tooShort ? <Banner>{TIKTOK_LENGTH}</Banner> : null}
-      {queue.length === 0 ? <p>Nothing is in review. Render a draft from the Board.</p> : null}
+      {queue.length === 0 && !loadError ? (
+        <p>Nothing is in review. Render a draft from the Board.</p>
+      ) : null}
       <div className="workspace">
         <ul className="picker">
           {queue.map((row) => (
@@ -784,12 +794,16 @@ function Review({ experiments, selectedId, onSelect, onChanged }) {
   );
 }
 
-function Post({ experiments, selectedId, onSelect, onChanged }) {
+function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
   const ready = experiments.filter((row) => row.status === "approved" || row.status === "live");
   const selected = ready.find((row) => row.id === selectedId) || ready[0] || null;
   const [forms, setForms] = useState({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    setError("");
+  }, [selected?.id]);
 
   useEffect(() => {
     if (!selected?.id) return undefined;
@@ -889,12 +903,23 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
       setError("This publication has no id yet.");
       return;
     }
+    const url = row.url.trim();
+    let parsed = null;
+    try {
+      parsed = new URL(url);
+    } catch {
+      parsed = null;
+    }
+    if (!parsed || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
+      setError("Enter the post URL, starting with http:// or https://.");
+      return;
+    }
     setBusy(`${platform}-url`);
     setError("");
     try {
       const data = await api(`/publications/${encodeURIComponent(publicationId)}/url`, {
         method: "POST",
-        body: JSON.stringify({ url: row.url }),
+        body: JSON.stringify({ url }),
       });
       const publication = publicationFrom(data) || { ...row.publication, post_url: row.url };
       update(platform, { publication });
@@ -914,7 +939,12 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
       setError("Post this video before recording views.");
       return;
     }
-    const views = Number(row.views);
+    const raw = String(row.views ?? "").trim();
+    if (!raw) {
+      setError("Enter the number of views to record.");
+      return;
+    }
+    const views = Number(raw);
     if (!Number.isFinite(views) || views < 0) {
       setError("Views must be zero or more.");
       return;
@@ -951,7 +981,10 @@ function Post({ experiments, selectedId, onSelect, onChanged }) {
   return (
     <>
       <Banner>{error}</Banner>
-      {ready.length === 0 ? <p>No approved or live experiment. Approve a cut in Review first.</p> : null}
+      <Banner>{loadError}</Banner>
+      {ready.length === 0 && !loadError ? (
+        <p>No approved or live experiment. Approve a cut in Review first.</p>
+      ) : null}
       <div className="workspace">
         <ul className="picker">
           {ready.map((row) => (
@@ -1392,20 +1425,31 @@ function Catalog({ onBuilt }) {
     }
     setBusy("niche");
     setError("");
-    try {
-      for (const nicheId of niches) {
+    const saved = [];
+    const failed = [];
+    let lastError = null;
+    for (const nicheId of niches) {
+      try {
         await api("/niches", {
           method: "POST",
           body: JSON.stringify({ id: nicheId, theme_id: theme, name: nicheId }),
         });
+        saved.push(nicheId);
+      } catch (err) {
+        failed.push(nicheId);
+        lastError = err;
       }
-      await loadCatalog();
-      await onBuilt(`Saved ${niches.length} niche${niches.length === 1 ? "" : "s"}.`);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy("");
     }
+    await loadCatalog();
+    if (saved.length > 0) {
+      await onBuilt(`Saved ${saved.length} niche${saved.length === 1 ? "" : "s"}.`);
+    }
+    if (failed.length > 0) {
+      setError(
+        `Saved ${saved.length} of ${niches.length}; could not add ${failed.join(", ")}. ${errorMessage(lastError)}`,
+      );
+    }
+    setBusy("");
   }
 
   async function saveOffer() {
@@ -1453,9 +1497,11 @@ function Catalog({ onBuilt }) {
     }
     setBusy("draft");
     setError("");
-    try {
-      const saved = [];
-      for (const nicheId of niches) {
+    const saved = [];
+    const failed = [];
+    let lastError = null;
+    for (const nicheId of niches) {
+      try {
         const data = await api("/experiments", {
           method: "POST",
           body: JSON.stringify({
@@ -1470,14 +1516,22 @@ function Catalog({ onBuilt }) {
           }),
         });
         saved.push(data);
+      } catch (err) {
+        failed.push(nicheId);
+        lastError = err;
       }
-      setCreated(unwrapList(saved.length === 1 ? saved[0] : saved));
-      await onBuilt(`Saved ${niches.length} experiment draft${niches.length === 1 ? "" : "s"}.`);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy("");
     }
+    setCreated(unwrapList(saved.length === 1 ? saved[0] : saved));
+    if (failed.length > 0) {
+      setNicheIds(failed.join(", "));
+      setError(
+        `Saved ${saved.length} of ${niches.length}; could not save ${failed.join(", ")}. ${errorMessage(lastError)} Press Save experiment draft again to retry only the remaining niches.`,
+      );
+    }
+    if (saved.length > 0) {
+      await onBuilt(`Saved ${saved.length} experiment draft${saved.length === 1 ? "" : "s"}.`);
+    }
+    setBusy("");
   }
 
   return (
@@ -1493,96 +1547,103 @@ function Catalog({ onBuilt }) {
       {catalogMissing ? (
         <p>No catalog route. Niche, voice, presenter, and hook stay text fields on this form.</p>
       ) : null}
-      <form onSubmit={buildStarter} className="stack">
-        <fieldset>
-          <legend>Starter</legend>
-          <div className="form-grid">
-            <div className="filter">
-              <label htmlFor="theme-id">Theme id</label>
-              <input
-                id="theme-id"
-                type="text"
-                value={themeId}
-                onChange={(event) => setThemeId(event.target.value)}
-                list="catalog-themes"
-                spellCheck={false}
-                autoCorrect="off"
-                autoCapitalize="off"
-                placeholder="history"
-              />
-              <datalist id="catalog-themes">
-                {hints.themes.map((id) => (
-                  <option key={id} value={id} />
-                ))}
-              </datalist>
+      <div className="stack">
+        <form onSubmit={buildStarter}>
+          <fieldset>
+            <legend>Starter</legend>
+            <div className="form-grid">
+              <div className="filter">
+                <label htmlFor="theme-id">Theme id</label>
+                <input
+                  id="theme-id"
+                  type="text"
+                  value={themeId}
+                  onChange={(event) => setThemeId(event.target.value)}
+                  list="catalog-themes"
+                  spellCheck={false}
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  placeholder="history"
+                />
+                <datalist id="catalog-themes">
+                  {hints.themes.map((id) => (
+                    <option key={id} value={id} />
+                  ))}
+                </datalist>
+              </div>
+              <div className="filter">
+                <label htmlFor="niche-id">Niche id</label>
+                <input
+                  id="niche-id"
+                  type="text"
+                  value={nicheIds}
+                  onChange={(event) => setNicheIds(event.target.value)}
+                  list="catalog-niches"
+                  spellCheck={false}
+                  placeholder="niche-a, niche-b"
+                />
+                <datalist id="catalog-niches">
+                  {hints.niches.map((id) => (
+                    <option key={id} value={id} />
+                  ))}
+                </datalist>
+              </div>
+              <div className="filter">
+                <label htmlFor="voice-id">Voice id</label>
+                <input
+                  id="voice-id"
+                  type="text"
+                  value={voiceId}
+                  onChange={(event) => setVoiceId(event.target.value)}
+                  list="catalog-voices"
+                  spellCheck={false}
+                />
+                <datalist id="catalog-voices">
+                  {hints.voices.map((id) => (
+                    <option key={id} value={id} />
+                  ))}
+                </datalist>
+              </div>
+              <div className="filter">
+                <label htmlFor="presenter-id">Presenter id</label>
+                <input
+                  id="presenter-id"
+                  type="text"
+                  value={presenterId}
+                  onChange={(event) => setPresenterId(event.target.value)}
+                  list="catalog-presenters"
+                  spellCheck={false}
+                />
+                <datalist id="catalog-presenters">
+                  {hints.presenters.map((id) => (
+                    <option key={id} value={id} />
+                  ))}
+                </datalist>
+              </div>
+              <div className="filter">
+                <label htmlFor="hook-id">Hook id</label>
+                <input
+                  id="hook-id"
+                  type="text"
+                  value={hookId}
+                  onChange={(event) => setHookId(event.target.value)}
+                  list="catalog-hooks"
+                  spellCheck={false}
+                />
+                <datalist id="catalog-hooks">
+                  {hints.hooks.map((id) => (
+                    <option key={id} value={id} />
+                  ))}
+                </datalist>
+              </div>
             </div>
-            <div className="filter">
-              <label htmlFor="niche-id">Niche id</label>
-              <input
-                id="niche-id"
-                type="text"
-                value={nicheIds}
-                onChange={(event) => setNicheIds(event.target.value)}
-                list="catalog-niches"
-                spellCheck={false}
-                placeholder="niche-a, niche-b"
-              />
-              <datalist id="catalog-niches">
-                {hints.niches.map((id) => (
-                  <option key={id} value={id} />
-                ))}
-              </datalist>
+            <div className="actions">
+              <button type="submit" disabled={busy === "starter"}>
+                Build starter grid
+              </button>
             </div>
-            <div className="filter">
-              <label htmlFor="voice-id">Voice id</label>
-              <input
-                id="voice-id"
-                type="text"
-                value={voiceId}
-                onChange={(event) => setVoiceId(event.target.value)}
-                list="catalog-voices"
-                spellCheck={false}
-              />
-              <datalist id="catalog-voices">
-                {hints.voices.map((id) => (
-                  <option key={id} value={id} />
-                ))}
-              </datalist>
-            </div>
-            <div className="filter">
-              <label htmlFor="presenter-id">Presenter id</label>
-              <input
-                id="presenter-id"
-                type="text"
-                value={presenterId}
-                onChange={(event) => setPresenterId(event.target.value)}
-                list="catalog-presenters"
-                spellCheck={false}
-              />
-              <datalist id="catalog-presenters">
-                {hints.presenters.map((id) => (
-                  <option key={id} value={id} />
-                ))}
-              </datalist>
-            </div>
-            <div className="filter">
-              <label htmlFor="hook-id">Hook id</label>
-              <input
-                id="hook-id"
-                type="text"
-                value={hookId}
-                onChange={(event) => setHookId(event.target.value)}
-                list="catalog-hooks"
-                spellCheck={false}
-              />
-              <datalist id="catalog-hooks">
-                {hints.hooks.map((id) => (
-                  <option key={id} value={id} />
-                ))}
-              </datalist>
-            </div>
-          </div>
-        </fieldset>
+          </fieldset>
+        </form>
         <fieldset>
           <legend>Money</legend>
           <div className="form-grid">
@@ -1697,9 +1758,6 @@ function Catalog({ onBuilt }) {
           <button type="button" onClick={saveOffer} disabled={busy === "offer"}>
             Save offer URL
           </button>
-          <button type="submit" disabled={busy === "starter"}>
-            Build starter grid
-          </button>
           <button type="button" onClick={saveExperimentDraft} disabled={busy === "draft"}>
             Save experiment draft
           </button>
@@ -1708,7 +1766,7 @@ function Catalog({ onBuilt }) {
           Save experiment draft uses the length above. Build starter grid always writes both styles at{" "}
           {starterSeconds} seconds.
         </p>
-      </form>
+      </div>
       {created.length > 0 ? (
         <section>
           <h2>Returned</h2>
@@ -1736,10 +1794,13 @@ export default function App() {
   const [selectedId, setSelectedId] = useState("");
   const [notice, setNotice] = useState("");
   const [drafts, setDrafts] = useState([]);
+  const loadSeqRef = useRef(0);
 
   async function loadExperiments() {
+    const seq = ++loadSeqRef.current;
     try {
       const data = await api("/experiments");
+      if (seq !== loadSeqRef.current) return;
       const list = unwrapList(data);
       setExperiments(list);
       setLoadError("");
@@ -1748,6 +1809,7 @@ export default function App() {
         return list[0]?.id || "";
       });
     } catch (error) {
+      if (seq !== loadSeqRef.current) return;
       setLoadError(errorMessage(error));
     }
   }
@@ -1808,6 +1870,7 @@ export default function App() {
               setNotice(message);
               await loadExperiments();
             }}
+            loadError={loadError}
           />
         ) : null}
         {screen === "Post" ? (
@@ -1819,6 +1882,7 @@ export default function App() {
               setNotice(message);
               await loadExperiments();
             }}
+            loadError={loadError}
           />
         ) : null}
         {screen === "Results" ? <Results /> : null}

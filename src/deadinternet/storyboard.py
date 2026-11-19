@@ -13,6 +13,18 @@ class UnsafeId(ValueError):
     pass
 
 
+# Characters Windows forbids in filenames (POSIX tolerates them, so the
+# guard is by character set, never by trying to touch the filesystem).
+_FORBIDDEN_CHARS = '<>:"|?*'
+
+# Windows reserves these device names with or without an extension.
+_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
 def check_segment(value: str) -> str:
     if (
         not isinstance(value, str)
@@ -21,6 +33,10 @@ def check_segment(value: str) -> str:
         or value in {".", ".."}
         or "/" in value
         or "\\" in value
+        or any(char in _FORBIDDEN_CHARS for char in value)
+        or any(ord(char) < 32 for char in value)
+        or value != value.rstrip(". ")
+        or value.split(".", 1)[0].upper() in _RESERVED_NAMES
     ):
         raise UnsafeId(f"unsafe id {value!r}")
     return value

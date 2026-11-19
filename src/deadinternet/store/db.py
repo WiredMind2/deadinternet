@@ -483,6 +483,8 @@ class Store:
         return _experiment_from_row(row)
 
     def save_experiment(self, experiment: Experiment) -> None:
+        # clicks and revenue_cents are owned by add_click and add_revenue
+        # alone: a save from a stale in-memory copy must never erase them.
         self._require_experiment(experiment.id)
         self._write(
             """
@@ -502,12 +504,28 @@ class Store:
                 file_path = ?,
                 render_error = ?,
                 language = ?,
-                clicks = ?,
-                revenue_cents = ?,
                 board_hash = ?
             WHERE id = ?
             """,
-            _experiment_values(experiment)[1:] + (experiment.id,),
+            (
+                experiment.niche_id,
+                experiment.hypothesis,
+                experiment.hook_id,
+                experiment.script,
+                experiment.caption,
+                _dump_style(experiment.style),
+                _dump_money(experiment.money),
+                experiment.status.value,
+                experiment.length_sec,
+                experiment.proposal_id,
+                experiment.approved_at,
+                experiment.measurement_window_days,
+                experiment.file_path,
+                experiment.render_error,
+                experiment.language,
+                experiment.board_hash,
+                experiment.id,
+            ),
         )
 
     def list_experiments(self) -> list[Experiment]:
@@ -586,20 +604,24 @@ class Store:
         ).fetchone()
         if row is None:
             raise KeyError(publication.id)
-        self._write(
-            """
-            UPDATE publications SET
-                experiment_id = ?,
-                platform = ?,
-                account_id = ?,
-                status = ?,
-                post_url = ?,
-                error = ?,
-                payout_cents = ?
-            WHERE id = ?
-            """,
-            _publication_values(publication)[1:] + (publication.id,),
-        )
+        try:
+            self._write(
+                """
+                UPDATE publications SET
+                    experiment_id = ?,
+                    platform = ?,
+                    account_id = ?,
+                    status = ?,
+                    post_url = ?,
+                    error = ?,
+                    payout_cents = ?
+                WHERE id = ?
+                """,
+                _publication_values(publication)[1:] + (publication.id,),
+            )
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            raise
 
     def add_snapshot(
         self,

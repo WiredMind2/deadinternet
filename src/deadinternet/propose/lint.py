@@ -34,7 +34,9 @@ NUMBER_RE = re.compile(
     "(?:%|k\\b|x\\b|hrs?\\b|hours?\\b|mins?\\b|minutes?\\b"  # without a unit
     "|days?\\b|weeks?\\b|months?\\b|years?\\b)?",
     re.IGNORECASE)
-PROPER_RE = re.compile(r"(?<!^)\b[A-Z][a-z]{2,}\b")
+# A capitalized word. A capital on word one is sentence case, not a name;
+# whether position matters is decided where the pattern is used.
+PROPER_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
 HASHTAG_RE = re.compile(r"(?:^|\s)(#[A-Za-z0-9_]+)")
 EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF☀-➿]")
 
@@ -141,7 +143,8 @@ def check_length(text: str) -> tuple[float, str]:
 def check_specificity(text: str) -> tuple[float, str]:
     """One concrete thing beats three abstract ones."""
     nums = [n.strip() for n in NUMBER_RE.findall(text) if n.strip()]
-    propers = set(PROPER_RE.findall(text))
+    # A match at char 0 is sentence case, not a name.
+    propers = {m.group() for m in PROPER_RE.finditer(text) if m.start()}
     low = [w.lower().strip("'’") for w in _words(text)]
     spoken = [w for w in low if w in SPOKEN_NUMBERS or w in MONEY_WORDS]
     hits = len(nums) + len(propers) + len(spoken)
@@ -175,7 +178,8 @@ def check_frontload(text: str) -> tuple[float, str]:
     penalty = 0
     hit_opener = None
     for weak in WEAK_OPENERS:
-        if opener.startswith(weak) or low[0] == weak:
+        # Whole token or the exact two-word phrase: "hire" is not "hi".
+        if low[0] == weak or opener == weak:
             penalty, hit_opener = 30, weak
             break
     payload = None

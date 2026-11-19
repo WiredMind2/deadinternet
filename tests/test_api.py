@@ -1,17 +1,24 @@
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from deadinternet.api import create_app
+from deadinternet.api.app import _render_cap
 from deadinternet.domain.experiment import (
     Affiliate,
     FacelessStyle,
     Look,
     Platform,
     PlatformPayout,
+    PublicationStatus,
     Status,
+    mark_rendered,
 )
-from deadinternet.api import create_app
 from tests.helpers import experiment, experiment_body, open_store
 
 NOW = "2026-10-31T12:00:00Z"
@@ -33,6 +40,25 @@ class _SpyRenderer:
         target = folder / f"{experiment.id}.mp4"
         target.write_bytes(b"video")
         return experiment
+
+
+class _SlowRenderer:
+    """Stands in for ffmpeg: slow enough to expose concurrent renders."""
+
+    def __init__(self, delay: float = 0.25):
+        self.delay = delay
+        self.calls: list[str] = []
+        self._lock = threading.Lock()
+
+    def render(self, experiment, media_dir):
+        with self._lock:
+            self.calls.append(experiment.id)
+        time.sleep(self.delay)
+        folder = Path(media_dir)
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"{experiment.id}.mp4"
+        target.write_bytes(b"video")
+        return mark_rendered(experiment, str(target))
 
 
 def test_approve_on_a_draft_returns_409(tmp_path):
@@ -239,7 +265,13 @@ def test_render_reaches_review_and_the_cap_is_429(tmp_path):
     assert store.get_experiment("exp-render").status == Status.in_review
     store.set_setting("render_cap", 0)
     with TestClient(create_app(store)) as client:
-        created = client.post("/experiments", json=experiment_body(id="exp-capped"))
+        created = client.post(
+            "/experiments",
+            json=experiment_body(
+                id="exp-capped",
+                money={"kind": "affiliate", "tracking_code": "code-capped", "merchant": "acme"},
+            ),
+        )
         assert created.status_code == 200
         assert client.post("/experiments/exp-capped/approve-board").status_code == 200
         capped = client.post("/experiments/exp-capped/render")
@@ -375,7 +407,16 @@ def test_media_serves_only_files_inside_the_media_dir(tmp_path):
     with TestClient(create_app(store, renderer=_WritingRenderer())) as client:
         hidden = client.get("/media/exp-out")
         assert hidden.status_code == 404
-        assert client.post("/experiments", json=experiment_body(id="exp-play")).status_code == 200
+        assert (
+            client.post(
+                "/experiments",
+                json=experiment_body(
+                    id="exp-play",
+                    money={"kind": "affiliate", "tracking_code": "code-play", "merchant": "acme"},
+                ),
+            ).status_code
+            == 200
+        )
         assert client.post("/experiments/exp-play/approve-board").status_code == 200
         rendered = client.post("/experiments/exp-play/render")
         assert rendered.status_code == 200
@@ -411,7 +452,13 @@ def test_results_report_views_from_the_latest_snapshots(tmp_path):
             f"/publications/{manual.json()['id']}/url",
             json={"url": "https://youtube.example/v/1"},
         ).status_code == 200
-        plain = client.post("/experiments", json=experiment_body(id="exp-plain"))
+        plain = client.post(
+            "/experiments",
+            json=experiment_body(
+                id="exp-plain",
+                money={"kind": "affiliate", "tracking_code": "code-plain", "merchant": "acme"},
+            ),
+        )
         assert plain.status_code == 200
         rows = client.get("/results").json()
     by_id = {row["id"]: row for row in rows}
@@ -473,3 +520,214 @@ def test_save_before_the_file_review_and_a_locked_board(tmp_path):
         )
         assert locked.status_code == 409
         assert board.read_text(encoding="utf-8") == before
+
+
+def test_duplicate_experiment_id_is_409_and_changes_nothing(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    with TestClient(create_app(store)) as client:
+        first = client.post("/experiments", json=experiment_body())
+        assert first.status_code == 200
+        board = tmp_path / "media" / "history" / "niche-1" / "exp-1.storyboard.json"
+        before = board.read_bytes()
+        row_before = store.get_experiment("exp-1")
+        second = client.post(
+            "/experiments",
+            json=experiment_body(hypothesis="A different take", script="A different script."),
+        )
+        assert second.status_code == 409
+        assert board.read_bytes() == before
+    assert store.get_experiment("exp-1") == row_before
+
+
+@pytest.mark.parametrize(
+    "bad_id", ["CON", "nul", "COM1", "lpt9", "a:b", "exp.", "tail ", "what?"]
+)
+def test_unsafe_experiment_ids_are_refused_with_nothing_written(tmp_path, bad_id):
+    store = open_store(tmp_path)
+    _series(store)
+    with TestClient(create_app(store)) as client:
+        response = client.post("/experiments", json=experiment_body(id=bad_id))
+        assert response.status_code == 422
+    assert store.list_experiments() == []
+    assert list(tmp_path.rglob("*.storyboard.json")) == []
+
+
+@pytest.mark.parametrize("bad_id", ["CON", "a:b", "name.", "sp "])
+def test_unsafe_theme_and_niche_ids_are_refused(tmp_path, bad_id):
+    store = open_store(tmp_path)
+    with TestClient(create_app(store)) as client:
+        theme = client.post("/themes", json={"id": bad_id, "name": "History"})
+        assert theme.status_code == 422
+        assert client.post("/themes", json={"id": "history", "name": "History"}).status_code == 200
+        niche = client.post("/niches", json={"id": bad_id, "theme_id": "history", "name": "War"})
+        assert niche.status_code == 422
+    assert store.list_niches() == []
+
+
+def test_manual_url_must_be_http_and_a_duplicate_is_409(tmp_path):
+    store = open_store(tmp_path)
+    store.insert_experiment(
+        experiment(id="exp-post", status=Status.in_review, file_path="data/videos/exp-post.mp4")
+    )
+    with TestClient(create_app(store)) as client:
+        assert client.post("/experiments/exp-post/approve", json={"now": NOW}).status_code == 200
+        first = client.post(
+            "/experiments/exp-post/publications",
+            json={"platform": "instagram", "account_id": "acct-1", "token": None},
+        )
+        second = client.post(
+            "/experiments/exp-post/publications",
+            json={"platform": "youtube", "account_id": "acct-1", "token": None},
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        refused = client.post(
+            f"/publications/{first.json()['id']}/url",
+            json={"url": "ftp://example.com/video"},
+        )
+        assert refused.status_code == 422
+        blank = client.post(
+            f"/publications/{first.json()['id']}/url",
+            json={"url": "   "},
+        )
+        assert blank.status_code == 422
+        assert {row["status"] for row in client.get("/experiments/exp-post/publications").json()} == {
+            "manual_needed"
+        }
+        posted = client.post(
+            f"/publications/{first.json()['id']}/url",
+            json={"url": "https://instagram.example/v/1"},
+        )
+        assert posted.status_code == 200
+        duplicate = client.post(
+            f"/publications/{second.json()['id']}/url",
+            json={"url": "https://instagram.example/v/1"},
+        )
+        assert duplicate.status_code == 409
+    by_id = {row.id: row for row in store.list_publications("exp-post")}
+    assert by_id[first.json()["id"]].post_url == "https://instagram.example/v/1"
+    assert by_id[second.json()["id"]].status is PublicationStatus.manual_needed
+
+
+def test_a_non_numeric_render_cap_falls_back_to_the_default(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    store.set_setting("render_cap", "banana")
+    with TestClient(create_app(store)) as client:
+        catalog = client.get("/catalog")
+        assert catalog.status_code == 200
+        assert catalog.json()["render_cap"] == 8
+        assert client.post("/experiments", json=experiment_body(id="exp-cap")).status_code == 200
+        assert client.post("/experiments/exp-cap/approve-board").status_code == 200
+        rendered = client.post("/experiments/exp-cap/render")
+        assert rendered.status_code == 200
+    for raw in (None, "", "  ", "8x", {"n": 1}, [4]):
+        store.set_setting("render_cap", raw)
+        assert _render_cap(store) == 8, raw
+
+
+def test_an_own_offer_experiment_without_a_url_is_refused(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    with TestClient(create_app(store)) as client:
+        refused = client.post(
+            "/experiments",
+            json=experiment_body(
+                id="exp-own",
+                money={"kind": "own_offer", "tracking_code": "own-1", "offer_url": "  "},
+            ),
+        )
+        assert refused.status_code == 422
+    assert store.list_experiments() == []
+    assert list(tmp_path.rglob("*.storyboard.json")) == []
+
+
+def test_an_offer_with_a_blank_url_is_refused(tmp_path):
+    store = open_store(tmp_path)
+    with TestClient(create_app(store)) as client:
+        response = client.post("/offers", json={"id": "acme", "url": "   "})
+    assert response.status_code == 422
+    assert store.get_offer("acme") is None
+
+
+def test_a_tracking_code_already_used_by_another_experiment_is_refused(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    with TestClient(create_app(store)) as client:
+        assert client.post("/experiments", json=experiment_body()).status_code == 200
+        affiliate_dup = client.post(
+            "/experiments",
+            json=experiment_body(id="exp-aff", caption="Another affiliate cut."),
+        )
+        assert affiliate_dup.status_code == 422
+        own_dup = client.post(
+            "/experiments",
+            json=experiment_body(
+                id="exp-own",
+                money={
+                    "kind": "own_offer",
+                    "tracking_code": "abc",
+                    "offer_url": "https://shop.example/offer",
+                },
+            ),
+        )
+        assert own_dup.status_code == 422
+    assert [row.id for row in store.list_experiments()] == ["exp-1"]
+    assert list(tmp_path.rglob("*.storyboard.json")) == [
+        tmp_path / "media" / "history" / "niche-1" / "exp-1.storyboard.json"
+    ]
+
+
+def test_concurrent_rends_cannot_overspend_the_cap(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    store.set_setting("render_cap", 1)
+    renderer = _SlowRenderer()
+    bodies = [
+        experiment_body(
+            id="exp-a",
+            money={"kind": "affiliate", "tracking_code": "code-a", "merchant": "acme"},
+        ),
+        experiment_body(
+            id="exp-b",
+            money={"kind": "affiliate", "tracking_code": "code-b", "merchant": "acme"},
+        ),
+    ]
+    with TestClient(create_app(store, renderer=renderer)) as client:
+        for body in bodies:
+            assert client.post("/experiments", json=body).status_code == 200
+            assert client.post(f"/experiments/{body['id']}/approve-board").status_code == 200
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(client.post, f"/experiments/{body['id']}/render") for body in bodies
+            ]
+            codes = sorted(future.result().status_code for future in futures)
+    assert codes == [200, 429]
+    day = datetime.now(timezone.utc).date().isoformat()
+    assert store.renders_started_today(day) == 1
+    assert len(renderer.calls) == 1
+
+
+def test_concurrent_rends_of_one_experiment_render_once(tmp_path):
+    store = open_store(tmp_path)
+    _series(store)
+    renderer = _SlowRenderer()
+    with TestClient(create_app(store, renderer=renderer)) as client:
+        assert (
+            client.post(
+                "/experiments",
+                json=experiment_body(
+                    id="exp-a",
+                    money={"kind": "affiliate", "tracking_code": "code-a", "merchant": "acme"},
+                ),
+            ).status_code
+            == 200
+        )
+        assert client.post("/experiments/exp-a/approve-board").status_code == 200
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(client.post, "/experiments/exp-a/render") for _ in range(2)]
+            codes = sorted(future.result().status_code for future in futures)
+    assert codes == [200, 409]
+    assert renderer.calls == ["exp-a"]
+    assert store.get_experiment("exp-a").status == Status.in_review

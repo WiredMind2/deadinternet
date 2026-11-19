@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -168,7 +169,7 @@ def test_live_publisher_without_a_token_packs_a_manual_post():
     assert result.publication.status.value == "manual_needed"
 
 
-def test_main_starts_the_local_server(monkeypatch):
+def test_main_starts_the_local_server(monkeypatch, tmp_path):
     seen = {}
 
     def fake_create_app(store, renderer, publisher, proposer):
@@ -186,6 +187,7 @@ def test_main_starts_the_local_server(monkeypatch):
     monkeypatch.setattr("deadinternet.__main__.create_app", fake_create_app)
     monkeypatch.setattr("deadinternet.__main__.uvicorn.run", fake_run)
     monkeypatch.setattr("deadinternet.__main__.Store", lambda path: path)
+    monkeypatch.chdir(tmp_path)
 
     from deadinternet.__main__ import main
 
@@ -193,7 +195,25 @@ def test_main_starts_the_local_server(monkeypatch):
     assert seen["app"] == "app"
     assert seen["host"] == "127.0.0.1"
     assert seen["port"] == 8000
-    assert seen["store"] == "data/deadinternet.sqlite"
+    repo_db = Path(__file__).resolve().parents[1] / "data" / "deadinternet.sqlite"
+    assert seen["store"] == str(repo_db)
     assert type(seen["renderer"]).__name__ == "LiveRenderer"
     assert type(seen["publisher"]).__name__ == "LivePublisher"
     assert type(seen["proposer"]).__name__ == "RepairProposer"
+
+
+def test_db_path_is_the_repo_database_whatever_the_cwd(monkeypatch, tmp_path):
+    from deadinternet.__main__ import _db_path
+
+    repo_db = Path(__file__).resolve().parents[1] / "data" / "deadinternet.sqlite"
+    assert _db_path() == repo_db
+    monkeypatch.chdir(tmp_path)
+    assert _db_path() == repo_db
+
+
+def test_store_creates_missing_data_directories_for_an_absolute_path(tmp_path):
+    from deadinternet.store import Store
+
+    target = tmp_path / "elsewhere" / "data" / "deadinternet.sqlite"
+    Store(str(target))
+    assert target.is_file()
