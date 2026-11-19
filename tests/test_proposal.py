@@ -11,7 +11,13 @@ from deadinternet.domain.experiment import (
     OwnOffer,
     Status,
 )
-from deadinternet.domain.proposal import Catalog, ProposalRejected, parse_proposal, starter_grid
+from deadinternet.domain.proposal import (
+    Catalog,
+    ProposalRejected,
+    changed_factors,
+    parse_proposal,
+    starter_grid,
+)
 from deadinternet.domain.rank import SAMPLE_FLOOR, below_sample_floor, cell_size, suggest
 
 
@@ -200,6 +206,76 @@ def test_a_draft_moving_two_factors_is_refused():
     )
     with pytest.raises(ProposalRejected, match="one deliberate factor"):
         parse_proposal([raw], catalog)
+
+
+_OFFER_URL = "https://shop.example/offer"
+
+
+def _raw_matching_parent(parent: Experiment, **overrides) -> dict:
+    """A draft that copies the parent except where the test overrides it."""
+    raw = {
+        "parent_ids": ["exp-parent"],
+        "factor_diffs": [],
+        "niche_id": parent.niche_id,
+        "style": {
+            "kind": "faceless",
+            "look": parent.style.look.value,
+            "voice_id": parent.style.voice_id,
+            "caption_style": parent.style.caption_style,
+        },
+        "money": {"kind": "affiliate", "tracking_code": "abc", "merchant": "acme"},
+        "hook_id": parent.hook_id,
+        "hypothesis": "One deliberate change.",
+        "script": "A different script entirely.",
+        "caption": "Caption",
+        "length_sec": parent.length_sec,
+    }
+    raw.update(overrides)
+    return raw
+
+
+def _wide_catalog(parent: Experiment) -> Catalog:
+    return _catalog(
+        niche_ids=frozenset({"niche-1", "niche-2"}),
+        offer_ids=frozenset({"acme", _OFFER_URL}),
+        parents={parent.id: parent},
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "changed"),
+    [
+        ({"niche_id": "niche-2"}, "niche"),
+        ({"money": {"kind": "own_offer", "tracking_code": "abc", "offer_url": _OFFER_URL}}, "money"),
+        ({"length_sec": 45}, "length"),
+    ],
+)
+def test_each_factor_alone_is_a_deliberate_change(overrides, changed):
+    """The one-factor rule accepts every factor on its own — niche, money
+    path, and length were never exercised before this matrix."""
+    parent = _parent()
+    drafts = parse_proposal([_raw_matching_parent(parent, **overrides)], _wide_catalog(parent))
+    assert changed_factors(drafts[0], parent) == [changed]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Niche plus style.
+        {"niche_id": "niche-2", "style": {"kind": "avatar", "presenter_id": "presenter-1", "voice_id": "voice-1"}},
+        # Money path plus hook.
+        {
+            "money": {"kind": "own_offer", "tracking_code": "abc", "offer_url": _OFFER_URL},
+            "hook_id": "result",
+        },
+        # Length plus niche.
+        {"length_sec": 45, "niche_id": "niche-2"},
+    ],
+)
+def test_two_factors_from_the_wide_matrix_are_refused(overrides):
+    parent = _parent()
+    with pytest.raises(ProposalRejected, match="one deliberate factor"):
+        parse_proposal([_raw_matching_parent(parent, **overrides)], _wide_catalog(parent))
 
 
 def test_a_draft_moving_exactly_one_factor_parses():

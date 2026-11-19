@@ -13,6 +13,7 @@ from deadinternet.domain.experiment import (
     AvatarStyle,
     Experiment,
     FacelessStyle,
+    FactorDiff,
     Look,
     Money,
     Niche,
@@ -94,7 +95,9 @@ CREATE TABLE IF NOT EXISTS experiments (
     language TEXT NOT NULL,
     clicks INTEGER NOT NULL DEFAULT 0,
     revenue_cents INTEGER NOT NULL DEFAULT 0,
-    board_hash TEXT
+    board_hash TEXT,
+    parent_ids_json TEXT,
+    factor_diffs_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS render_starts (
@@ -223,6 +226,27 @@ def _platform_text(platform: Platform | str) -> str:
     return str(platform)
 
 
+def _dump_factor_diffs(diffs: tuple[FactorDiff, ...]) -> str:
+    return json.dumps(
+        [
+            {"field": diff.field, "parent_value": diff.parent_value, "next_value": diff.next_value}
+            for diff in diffs
+        ]
+    )
+
+
+def _load_factor_diffs(payload: str | None) -> tuple[FactorDiff, ...]:
+    if not payload:
+        return ()
+    return tuple(FactorDiff(**item) for item in json.loads(payload))
+
+
+def _load_parent_ids(payload: str | None) -> tuple[str, ...]:
+    if not payload:
+        return ()
+    return tuple(str(item) for item in json.loads(payload))
+
+
 def _experiment_values(experiment: Experiment) -> tuple:
     return (
         experiment.id,
@@ -244,6 +268,8 @@ def _experiment_values(experiment: Experiment) -> tuple:
         experiment.clicks,
         experiment.revenue_cents,
         experiment.board_hash,
+        json.dumps(list(experiment.parent_ids)),
+        _dump_factor_diffs(experiment.factor_diffs),
     )
 
 
@@ -268,6 +294,8 @@ def _experiment_from_row(row: sqlite3.Row) -> Experiment:
         clicks=row["clicks"],
         revenue_cents=row["revenue_cents"],
         board_hash=row["board_hash"],
+        parent_ids=_load_parent_ids(row["parent_ids_json"]),
+        factor_diffs=_load_factor_diffs(row["factor_diffs_json"]),
     )
 
 
@@ -307,6 +335,7 @@ class Store:
         self._migrate_legacy_niches()
         self._conn.executescript(_SCHEMA)
         self._ensure_board_hash()
+        self._ensure_lineage()
         self._ensure_unique_tracking_codes()
         self._ensure_click_log()
 
@@ -376,6 +405,19 @@ class Store:
         columns = self._column_names("experiments")
         if columns and "board_hash" not in columns:
             self._conn.execute("ALTER TABLE experiments ADD COLUMN board_hash TEXT")
+            self._conn.commit()
+
+    def _ensure_lineage(self) -> None:
+        """US-031: rows saved before lineage existed read back with no
+        parents and no factor diffs. Idempotent."""
+        columns = self._column_names("experiments")
+        if not columns:
+            return
+        if "parent_ids_json" not in columns:
+            self._conn.execute("ALTER TABLE experiments ADD COLUMN parent_ids_json TEXT")
+            self._conn.commit()
+        if "factor_diffs_json" not in columns:
+            self._conn.execute("ALTER TABLE experiments ADD COLUMN factor_diffs_json TEXT")
             self._conn.commit()
 
     def _ensure_unique_tracking_codes(self) -> None:
@@ -568,8 +610,9 @@ class Store:
                 id, niche_id, hypothesis, hook_id, script, caption,
                 style_json, money_json, status, length_sec,
                 proposal_id, approved_at, measurement_window_days,
-                file_path, render_error, language, clicks, revenue_cents, board_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_path, render_error, language, clicks, revenue_cents, board_hash,
+                parent_ids_json, factor_diffs_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _experiment_values(experiment),
         )
@@ -606,7 +649,9 @@ class Store:
                 file_path = ?,
                 render_error = ?,
                 language = ?,
-                board_hash = ?
+                board_hash = ?,
+                parent_ids_json = ?,
+                factor_diffs_json = ?
             WHERE id = ?
             """,
             (
@@ -626,6 +671,8 @@ class Store:
                 experiment.render_error,
                 experiment.language,
                 experiment.board_hash,
+                json.dumps(list(experiment.parent_ids)),
+                _dump_factor_diffs(experiment.factor_diffs),
                 experiment.id,
             ),
         )

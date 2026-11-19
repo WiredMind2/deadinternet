@@ -129,6 +129,20 @@ class Niche:
 
 
 @dataclass(frozen=True)
+class FactorDiff:
+    """One factor an accepted draft moved, with the value on either side.
+
+    The proposal pipeline keeps its own FactorDiff on the draft
+    (domain/proposal.py). That module imports from this one, never the
+    reverse, so the experiment-side shape is defined here and shares its
+    field names with the proposal's."""
+
+    field: str
+    parent_value: str
+    next_value: str
+
+
+@dataclass(frozen=True)
 class Experiment:
     id: str
     niche_id: str
@@ -141,6 +155,8 @@ class Experiment:
     status: Status
     length_sec: int
     proposal_id: str | None = None
+    parent_ids: tuple[str, ...] = ()
+    factor_diffs: tuple[FactorDiff, ...] = ()
     approved_at: str | None = None
     measurement_window_days: int = 7
     file_path: str | None = None

@@ -18,6 +18,7 @@ from deadinternet.domain.experiment import (
     AvatarStyle,
     Beat,
     Experiment,
+    FactorDiff,
     IneligibleLength,
     InvalidBoard,
     InvalidTransition,
@@ -39,6 +40,7 @@ from deadinternet.domain.experiment import (
     request_render,
     revise_board,
     script_from_beats,
+    style_key,
 )
 from deadinternet.storyboard import (
     UnsafeId,
@@ -52,7 +54,9 @@ from deadinternet.domain.proposal import (
     DraftSpec,
     ProposalRejected,
     _money_from,
+    _money_path_key,
     _style_from,
+    changed_factors,
     starter_grid,
 )
 from deadinternet.propose.agent import ProposerFailed, ProposerUnavailable
@@ -147,6 +151,10 @@ class ExperimentIn(BaseModel):
     money: dict[str, Any]
     length_sec: int
     proposal_id: str | None = None
+    # US-031: lineage an accepted draft carries. The declared factor_diffs
+    # are advisory only; the server derives what it stores.
+    parent_ids: list[str] | None = None
+    factor_diffs: list[dict[str, Any]] | None = None
     language: str = "en"
     measurement_window_days: int = Field(default=7, ge=1)
 
@@ -379,6 +387,8 @@ def create_app(
             check_segment(experiment.id)
         except (KeyError, ValueError, TypeError, UnsafeId) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        parent_ids, factor_diffs = _lineage(store, raw, experiment)
+        experiment = replace(experiment, parent_ids=parent_ids, factor_diffs=factor_diffs)
         _guard_length(experiment)
         _reject_unusable_own_offer_url(experiment.money)
         _reject_unsafe_tracking_code(experiment.money)
@@ -461,9 +471,13 @@ def create_app(
         except Exception as exc:
             # A crash between the claim and the save would strand the row in
             # `rendering` forever: no route can re-enter that state except
-            # this one, so the failure is recorded before it propagates.
+            # this one, so the failure is recorded before it propagates. A
+            # finished render whose SAVE then failed is marked failed too —
+            # recoverable-wrong beats unrecoverable-stuck, since render_failed
+            # can re-render. The 500 carries the reason so the dashboard
+            # names it instead of showing a generic failure.
             store.save_experiment(mark_render_failed(rendering, str(exc)))
-            raise
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         finally:
             # Keep the in-flight claim until the result is saved: releasing it
             # earlier would let a same-experiment request re-read the stale
@@ -591,6 +605,11 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         created = []
         niche_by_id = {niche.id: niche for niche in niches}
+        # Known behavior (audited 2026-11-19): each draft is its own
+        # transaction. No reachable input fails mid-loop — codes are minted
+        # per draft against the store and ids are UUIDs — but a mid-loop IO
+        # error would leave the earlier drafts stored. The operator can
+        # reject them; the grid is not rolled back.
         for draft in drafts:
             experiment = _experiment_from_draft(draft)
             niche = niche_by_id[draft.niche_id]
@@ -647,10 +666,16 @@ def create_app(
     @app.post("/snapshots")
     def create_snapshot(body: SnapshotIn):
         _require_publication(store, body.publication_id)
-        # Snapshots order by captured_at (US-030): a value _parse_iso cannot
-        # read would corrupt the history's order, so it is refused up front.
-        if body.captured_at is not None and _parse_iso(body.captured_at) is None:
-            raise HTTPException(status_code=422, detail="captured_at must be an ISO timestamp")
+        # Snapshots order by captured_at as a string (US-030): mixed offsets
+        # or a space separator would sort wrongly, so a parseable value is
+        # normalised to UTC Z-form and an unparseable one is refused.
+        if body.captured_at is not None:
+            parsed = _parse_iso(body.captured_at)
+            if parsed is None:
+                raise HTTPException(status_code=422, detail="captured_at must be an ISO timestamp")
+            body.captured_at = (
+                parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            )
         record_snapshot(store, body.publication_id, body.model_dump())
         return {"ok": True}
 
@@ -808,11 +833,13 @@ def _guard_length(experiment: Experiment) -> None:
 
 def _reject_unusable_own_offer_url(money) -> None:
     """A click on /r/{code} opens this URL (US-011): it must exist and be a
-    web URL on every creation path, or the counted click 302s nowhere."""
+    web URL on every creation path, or the counted click 302s nowhere. The
+    RAW value is judged — the store keeps what was sent, so a padded URL
+    that only looks clean after strip() is refused outright."""
     if not isinstance(money, OwnOffer):
         return
-    url = money.offer_url.strip()
-    if not url:
+    url = money.offer_url
+    if not url.strip():
         raise HTTPException(status_code=422, detail="own_offer money needs an offer_url")
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=422, detail="own_offer offer_url must start with http:// or https://")
@@ -823,11 +850,15 @@ _SAFE_CODE_RE = re.compile(r"[A-Za-z0-9._~-]+")
 
 def _reject_unsafe_tracking_code(money) -> None:
     """The code becomes the /r/{code} path segment (US-024): a code with a
-    space or a slash can never be hit, so it never reaches the store."""
+    space or a slash can never be hit, so it never reaches the store. The
+    RAW value is judged, so `" abc "` is refused rather than stored with
+    the padding; dot-only codes are refused as path-traversal shapes."""
     if not isinstance(money, (Affiliate, OwnOffer)):
         return
-    code = money.tracking_code.strip()
-    if code and not _SAFE_CODE_RE.fullmatch(code):
+    code = money.tracking_code
+    if not code:
+        return
+    if not _SAFE_CODE_RE.fullmatch(code) or not code.strip("."):
         raise HTTPException(
             status_code=422,
             detail="tracking_code must be letters, digits, dots, hyphens, or underscores",
@@ -1008,6 +1039,56 @@ def _experiment_from_draft(draft: DraftSpec) -> Experiment:
     )
 
 
+def _lineage(store, raw: dict, experiment: Experiment) -> tuple[tuple[str, ...], tuple[FactorDiff, ...]]:
+    """US-031: an accepted draft keeps its parents, and the stored factor
+    list is derived from those parents with changed_factors. The declared
+    list is advisory only: the server never writes what the body claimed."""
+    parent_ids = tuple(str(item) for item in raw.get("parent_ids") or ())
+    if not parent_ids:
+        return (), ()
+    parents = []
+    for parent_id in parent_ids:
+        try:
+            parents.append(store.get_experiment(parent_id))
+        except KeyError:
+            raise HTTPException(status_code=422, detail=f"unknown parent {parent_id}") from None
+    draft = DraftSpec(
+        parent_ids=parent_ids,
+        factor_diffs=(),
+        niche_id=experiment.niche_id,
+        style=experiment.style,
+        money=experiment.money,
+        hook_id=experiment.hook_id,
+        hypothesis=experiment.hypothesis,
+        script=experiment.script,
+        caption=experiment.caption,
+        length_sec=experiment.length_sec,
+    )
+    diffs: list[FactorDiff] = []
+    for parent in parents:
+        for field in changed_factors(draft, parent):
+            parent_value, next_value = _factor_values(field, draft, parent)
+            diffs.append(
+                FactorDiff(field=field, parent_value=parent_value, next_value=next_value)
+            )
+    return parent_ids, tuple(diffs)
+
+
+def _factor_values(field: str, draft: DraftSpec, parent: Experiment) -> tuple[str, str]:
+    """The values on either side of one changed factor, as Results can name them."""
+    if field == "niche":
+        return parent.niche_id, draft.niche_id
+    if field == "style":
+        return "/".join(style_key(parent.style)), "/".join(style_key(draft.style))
+    if field == "money":
+        # The money factor is the path, not the click code: every child
+        # mints its own code (US-024), so the diff names the path only.
+        return "/".join(_money_path_key(parent.money)), "/".join(_money_path_key(draft.money))
+    if field == "hook":
+        return parent.hook_id, draft.hook_id
+    return str(parent.length_sec), str(draft.length_sec)
+
+
 def _style_json(style: Style) -> dict:
     kind = style.kind
     if kind == "faceless":
@@ -1047,6 +1128,11 @@ def _experiment_json(store, experiment: Experiment) -> dict:
         "status": experiment.status.value,
         "length_sec": experiment.length_sec,
         "proposal_id": experiment.proposal_id,
+        "parent_ids": list(experiment.parent_ids),
+        "factor_diffs": [
+            {"field": diff.field, "parent_value": diff.parent_value, "next_value": diff.next_value}
+            for diff in experiment.factor_diffs
+        ],
         "approved_at": experiment.approved_at,
         "measurement_window_days": experiment.measurement_window_days,
         "file_path": experiment.file_path,

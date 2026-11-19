@@ -36,6 +36,11 @@ function viewsOf(row) {
   return undefined;
 }
 
+function changedFactors(row) {
+  if (!Array.isArray(row?.factor_diffs)) return [];
+  return [...new Set(row.factor_diffs.map((diff) => diff?.field).filter(Boolean))];
+}
+
 function percentViewed(watchTimeSeconds, lengthSec) {
   const watched = Number(watchTimeSeconds);
   const length = Number(lengthSec);
@@ -217,6 +222,8 @@ function draftPayload(draft) {
     ...(draft.language ? { language: draft.language } : {}),
     ...(draft.proposal_id ? { proposal_id: draft.proposal_id } : {}),
     ...(Array.isArray(draft.beats) ? { beats: draft.beats } : {}),
+    ...(Array.isArray(draft.parent_ids) ? { parent_ids: draft.parent_ids } : {}),
+    ...(Array.isArray(draft.factor_diffs) ? { factor_diffs: draft.factor_diffs } : {}),
   };
 }
 
@@ -699,7 +706,11 @@ function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error 
       await onChanged(`Completed ${selected.id}.`);
     } catch (err) {
       setActionError(errorMessage(err));
-      setWindowBlocked(err.status === 409);
+      // Only the window 409 offers the override; a stale-row 409 must not.
+      setWindowBlocked(
+        err.status === 409 &&
+          String(errorMessage(err)).includes("measurement window ends"),
+      );
     } finally {
       setBusy("");
     }
@@ -1230,7 +1241,11 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
       await onChanged(`Completed ${selected.id}. Suggest can use it.`);
     } catch (err) {
       setError(errorMessage(err));
-      setWindowBlocked(err.status === 409);
+      // Only the window 409 offers the override; a stale-row 409 must not.
+      setWindowBlocked(
+        err.status === 409 &&
+          String(errorMessage(err)).includes("measurement window ends"),
+      );
     } finally {
       setBusy("");
     }
@@ -1476,7 +1491,12 @@ function Results() {
         {rows.map((row, index) => {
           const views = viewsOf(row);
           const title = [row.niche_id, styleKind(row), moneyKind(row)].filter(Boolean).join(" · ");
-          const below = row.below_sample_floor === true || row.below_sample_floor === "true";
+          // The floor note belongs to the verdict: a complete row in a thin
+          // cell. Drafts and live rows carry no verdict yet.
+          const below =
+            row.status === "complete" &&
+            (row.below_sample_floor === true || row.below_sample_floor === "true");
+          const changed = changedFactors(row);
           return (
             <article key={row.id || `${title}-${index}`} className="panel">
               <h2>{title || row.id || "Cell"}</h2>
@@ -1500,6 +1520,11 @@ function Results() {
                   </div>
                 ) : null}
               </dl>
+              {changed.length > 0 ? (
+                <p className="meta">
+                  changed: <span className="mono">{changed.join(", ")}</span>
+                </p>
+              ) : null}
               {below ? (
                 <p className="floor">Completed videos in this cell are below the sample floor.</p>
               ) : null}

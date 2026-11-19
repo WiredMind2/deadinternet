@@ -8,6 +8,7 @@ from deadinternet.domain.experiment import (
     AvatarStyle,
     Experiment,
     FacelessStyle,
+    FactorDiff,
     Look,
     OwnOffer,
     Platform,
@@ -18,6 +19,14 @@ from deadinternet.domain.experiment import (
     Affiliate,
 )
 from deadinternet.store import Store
+from tests.helpers import OPENED_STORES, experiment
+
+
+def _store(path) -> Store:
+    """A Store the conftest cleanup closes with the open_store() ones."""
+    store = Store(str(path))
+    OPENED_STORES.append(store)
+    return store
 
 
 def _faceless(**overrides) -> Experiment:
@@ -147,7 +156,7 @@ def test_round_trip_faceless_affiliate_and_avatar_own_offer(tmp_path):
 
 
 def test_a_save_between_click_and_revenue_never_erases_them(tmp_path):
-    store = Store(str(tmp_path / "lab.sqlite"))
+    store = _store(tmp_path / "lab.sqlite")
     face = _faceless(clicks=3, revenue_cents=0)
     store.insert_experiment(face)
 
@@ -167,7 +176,7 @@ def test_a_save_between_click_and_revenue_never_erases_them(tmp_path):
 def test_record_revenue_on_an_unknown_experiment_changes_nothing(tmp_path):
     """US-026: the total and the ledger are one transaction, so a refused
     recording leaves both exactly as they were."""
-    store = Store(str(tmp_path / "lab.sqlite"))
+    store = _store(tmp_path / "lab.sqlite")
     face = _faceless()
     store.insert_experiment(face)
 
@@ -180,7 +189,7 @@ def test_record_revenue_on_an_unknown_experiment_changes_nothing(tmp_path):
 
 
 def test_second_add_of_the_same_post_url_keeps_one_publication(tmp_path):
-    store = Store(str(tmp_path / "lab.sqlite"))
+    store = _store(tmp_path / "lab.sqlite")
     face = _faceless()
     avatar = _avatar()
     store.insert_experiment(face)
@@ -246,7 +255,7 @@ def test_second_add_of_the_same_post_url_keeps_one_publication(tmp_path):
 
 
 def test_renders_started_today_counts_only_that_day(tmp_path):
-    store = Store(str(tmp_path / "lab.sqlite"))
+    store = _store(tmp_path / "lab.sqlite")
     store.record_render_start("exp-face", "2026-10-31")
     store.record_render_start("exp-face", "2026-10-31")
     store.record_render_start("exp-avatar", "2026-11-01")
@@ -291,7 +300,7 @@ def test_add_click_matches_affiliate_or_own_offer_tracking_code(tmp_path):
 
 
 def test_catalog_lists_ids_and_every_experiment(tmp_path):
-    store = Store(str(tmp_path / "lab.sqlite"))
+    store = _store(tmp_path / "lab.sqlite")
     store.upsert_theme("history", "History")
     store.upsert_theme("history", "History", language="fr")
     store.upsert_niche("niche-1", "history", "Floor mats")
@@ -333,7 +342,7 @@ def test_catalog_lists_ids_and_every_experiment(tmp_path):
 
 
 def test_snapshots_keep_insert_order(tmp_path):
-    store = Store(str(tmp_path / "lab.sqlite"))
+    store = _store(tmp_path / "lab.sqlite")
     face = _faceless()
     store.insert_experiment(face)
     publication = store.add_publication(
@@ -434,7 +443,7 @@ def test_legacy_niche_rows_become_a_theme_and_a_series(tmp_path):
     conn.commit()
     conn.close()
 
-    store = Store(str(path))
+    store = _store(path)
     assert store.get_theme("history").language == "en"
     niche = store.get_niche("history")
     assert niche.theme_id == "history"
@@ -515,7 +524,7 @@ def test_legacy_duplicate_tracking_codes_are_renamed_not_deleted(tmp_path):
     conn.commit()
     conn.close()
 
-    store = Store(str(path))
+    store = _store(path)
     first = store.get_experiment("exp-first")
     second = store.get_experiment("exp-second")
     # The earliest row keeps the shared code; the later duplicate is recoded.
@@ -527,7 +536,7 @@ def test_legacy_duplicate_tracking_codes_are_renamed_not_deleted(tmp_path):
         store.insert_experiment(replace(first, id="exp-new"))
 
     # Re-opening the migrated file is a no-op: the codes stay put.
-    reopened = Store(str(path))
+    reopened = _store(path)
     assert reopened.get_experiment("exp-first").money.tracking_code == "abc"
     assert reopened.get_experiment("exp-second").money.tracking_code == "abc-2"
 
@@ -554,13 +563,118 @@ def test_legacy_click_counters_are_backfilled_into_the_log(tmp_path):
     conn.commit()
     conn.close()
 
-    store = Store(str(path))
+    store = _store(path)
     times = store.list_click_times("exp-clicks")
     assert len(times) == 5
     assert all(times[0] == stamp for stamp in times)
     assert store.get_experiment("exp-clicks").clicks == 5
 
     # Re-opening neither adds rows nor moves the counter.
-    reopened = Store(str(path))
+    reopened = _store(path)
     assert len(reopened.list_click_times("exp-clicks")) == 5
     assert reopened.get_experiment("exp-clicks").clicks == 5
+
+
+def test_lineage_round_trips_through_insert_and_save(tmp_path):
+    """US-031: parent_ids and factor_diffs persist on the experiment, and a
+    save never erases them."""
+    store = _store(tmp_path / "lab.sqlite")
+    parent = _faceless()
+    store.insert_experiment(parent)
+    child = _avatar(
+        parent_ids=(parent.id,),
+        factor_diffs=(
+            FactorDiff(
+                field="style",
+                parent_value="faceless/clips/voice-1/bold",
+                next_value="avatar/presenter-1/voice-2",
+            ),
+        ),
+    )
+    store.insert_experiment(child)
+    assert store.get_experiment(child.id) == child
+
+    saved = replace(child, status=Status.complete)
+    store.save_experiment(saved)
+    kept = store.get_experiment(child.id)
+    assert kept.status is Status.complete
+    assert kept.parent_ids == (parent.id,)
+    assert kept.factor_diffs == child.factor_diffs
+
+    reopened = _store(tmp_path / "lab.sqlite")
+    assert reopened.get_experiment(child.id) == saved
+
+
+def test_legacy_rows_upgrade_with_empty_lineage(tmp_path):
+    """US-031: a legacy database without the lineage columns upgrades
+    cleanly. Old rows read back with no parents and no factor diffs, and
+    new lineage written afterwards round-trips."""
+    path = tmp_path / "legacy-lineage.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE niches (id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO niches (id, name, language) VALUES ('history', 'History', 'en')")
+    conn.execute(_LEGACY_EXPERIMENTS_SCHEMA)
+    conn.execute(
+        """
+        INSERT INTO experiments (
+            id, niche_id, hypothesis, hook_id, script, caption, style_json, money_json,
+            status, length_sec, measurement_window_days, language
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        _legacy_row("exp-old", "abc"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = _store(path)
+    loaded = store.get_experiment("exp-old")
+    assert loaded.parent_ids == ()
+    assert loaded.factor_diffs == ()
+
+    child = _faceless(
+        id="exp-child",
+        money=Affiliate(tracking_code="aff-child", merchant="acme"),
+        parent_ids=("exp-old",),
+        factor_diffs=(FactorDiff(field="hook", parent_value="question", next_value="result"),),
+    )
+    store.insert_experiment(child)
+    approved = replace(child, status=Status.board_approved)
+    store.save_experiment(approved)
+    assert store.get_experiment("exp-child") == approved
+
+    # Re-opening the migrated file is a no-op: the columns stay in place.
+    reopened = _store(path)
+    assert reopened.get_experiment("exp-old").parent_ids == ()
+    assert reopened.get_experiment("exp-child") == approved
+
+
+def test_a_failed_ledger_insert_rolls_the_total_back(tmp_path):
+    """US-026: the total and the ledger are one transaction. A trigger
+    aborts the ledger insert; the raised UPDATE must roll back with it."""
+    store = _store(tmp_path / "lab.sqlite")
+    store.insert_experiment(experiment(id="exp-1"))
+    store._conn.execute(
+        "CREATE TRIGGER no_ledger BEFORE INSERT ON revenue_ledger "
+        "BEGIN SELECT RAISE(ABORT, 'boom'); END"
+    )
+    with pytest.raises(sqlite3.Error, match="boom"):
+        store.record_revenue("exp-1", 250, "tiktok", "2026-11-19T00:00:00Z")
+    assert store.get_experiment("exp-1").revenue_cents == 0
+    assert store.list_revenue_entries("exp-1") == []
+
+
+def test_a_failed_click_log_insert_rolls_the_counter_back(tmp_path):
+    """US-025: the counter and the log are one transaction. A trigger
+    aborts the log insert; the counter must roll back with it."""
+    store = _store(tmp_path / "lab.sqlite")
+    store.insert_experiment(experiment(id="exp-1"))
+    store._conn.execute(
+        "CREATE TRIGGER no_click_log BEFORE INSERT ON clicks "
+        "BEGIN SELECT RAISE(ABORT, 'boom'); END"
+    )
+    with pytest.raises(sqlite3.Error, match="boom"):
+        store.add_click("abc")
+    assert store.get_experiment("exp-1").clicks == 0
+    assert store.list_click_times("exp-1") == []

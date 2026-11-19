@@ -35,9 +35,9 @@ index and `archive/` before minting a new one.
 | US-026 | Record payouts and revenue | 5 | Done |
 | US-027 | The ranker learns honestly | 5 | Done |
 | US-030 | Record the full snapshot and see the trend | 3 | Done |
-| US-031 | Accepted drafts keep their parent and factor list | 3 | Ready |
-| US-032 | Faceless stills render speaks each beat | 5 | Ready |
-| US-033 | Burned-in captions from beat on-screen text | 3 | Ready |
+| US-031 | Accepted drafts keep their parent and factor list | 3 | Done |
+| US-032 | Faceless stills render speaks each beat | 5 | Done |
+| US-033 | Burned-in captions from beat on-screen text | 3 | Done |
 | US-034 | Public read-only click app | 3 | Ready |
 | US-035 | The window starts at the first post, on the server clock | 2 | Ready |
 | US-036 | Money paths are scored apart | 3 | Ready |
@@ -70,22 +70,50 @@ own-offer URLs must be http(s) and codes must be URL-safe on every creation
 path, approve refuses an unparseable clock, and the test suite was
 hardened (clock-independent flow test, window-boundary and factor-matrix
 coverage, connection cleanup via `Store.close()` + conftest). The whole
-operator loop was verified in the browser on a temp lab: grid → board →
-render → approve → publish → the 409 naming the window end with the
-override → payout ledger → results with windowed clicks and the floor
-note → the 422 on thin suggest.
+operator loop was verified in the browser on a temp lab on 2026-11-19:
+grid → board → render → approve → publish with a pasted URL → the 409
+naming the window end answered with the override button (409 then 200 in
+the server log) → payout ledger and the refreshed revenue column →
+results with windowed clicks and the floor note → the 422 on thin
+suggest. The snapshot recording form itself was not exercised in that
+run; the history readback was (two GETs in the server log).
 
-Wave 3 — make something worth scoring and keep the operator honest:
-US-031 (lineage on accepted drafts), US-032 and US-033 (faceless render
-with per-beat speech and burned-in captions), US-034 (public read-only
-/r/ click app). Honesty follow-ups: US-035 (window anchored to the first
-post, server clock), US-036 (money paths scored apart), US-037 (payout
-reversals), US-038 (absent vs zero snapshots), US-039 (migration renames
-surfaced), US-040 (stale publication on Post). Explicitly deferred per
-the reflexion: auto-posting clients, the avatar provider, a smarter LLM
-proposer, bandit statistics, stock-footage clips, splitting App.jsx, an
-ORM, a scheduler. The cell not controlling for hook and length (review
-finding G6) waits until US-031 stores lineage.
+A closing opus audit (saved beside this register as
+`opus-audit-2026-11-19-landing.md`) confirmed seven of ten landing claims,
+found two real bugs the landing introduced (snapshots sorted as raw
+strings, so mixed offsets order wrongly; codes validated stripped but
+stored raw, so padded codes pass), and flagged four coverage debts (the
+factor matrix, the thin-row exclusion from `list_finished`, failure
+injection for the revenue/click transactions, the un-registered direct
+`Store()` constructions). All of them were fixed in the next landing:
+`captured_at` is normalised to UTC at the route, codes and offer URLs are
+judged on their raw values (dot-only codes refused), the floor note shows
+only on complete rows, a render crash answers with a 500 carrying the
+reason, the override button appears only for the measurement-window 409,
+the factor matrix, thin-row exclusion, and trigger-based failure
+injection tests exist, and every test store is registered for conftest
+cleanup. Deliberately accepted: the starter grid can abort half-built on
+a mid-loop IO failure (no reachable input triggers it — codes are minted,
+ids are UUIDs; a code comment documents it), and the override button
+skips a confirm dialog (its label names the action).
+
+Wave 3 opened on main 2026-11-19: US-031 (lineage on accepted drafts —
+parents and server-derived factor lists stored and shown on Results),
+US-032 and US-033 (the faceless render speaks each beat and burns in
+`on_screen` captions, per-beat timing from the audio, env-gated TTS
+mirroring the avatar stub, verified against real ffmpeg on this
+machine). Caveat: no TTS provider is wired, so a live faceless render
+lands `render_failed` naming `DEADINTERNET_TTS_API_KEY` until an
+operator supplies a real speaker; the pipeline itself is verified with a
+synthetic one. Remaining backlog: US-034 (public read-only /r/ click
+app), US-035 (window anchored to the first post, server clock), US-036
+(money paths scored apart), US-037 (payout reversals), US-038 (absent vs
+zero snapshots), US-039 (migration renames surfaced), US-040 (stale
+publication on Post). Explicitly deferred per the reflexion:
+auto-posting clients, the avatar provider, a smarter LLM proposer,
+bandit statistics, stock-footage clips, splitting App.jsx, an ORM, a
+scheduler. The cell not controlling for hook and length (review finding
+G6) can now be revisited on the stored lineage.
 
 ## Collisions
 
@@ -98,5 +126,7 @@ finding G6) waits until US-031 stores lineage.
 
 - Definition of done: `definition-of-done.md`.
 - Archive: `archive/` (empty). Never delete it.
+- Landing reviews: `opus-reflexion-2026-11-19-wave2.md` (before the landing),
+  `opus-audit-2026-11-19-landing.md` (closing audit of c6d7614).
 - No Scrum pack existed when this register was created, so there is no `docs/agile/`.
 - Prior design docs live in `docs/superpowers/specs/`; the 2026-11-01 one drove the theme/niche/storyboard work already merged.

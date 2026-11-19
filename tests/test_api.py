@@ -11,6 +11,7 @@ from deadinternet.api import create_app
 from deadinternet.api.app import _clicks_window, _render_cap
 from deadinternet.domain.experiment import (
     Affiliate,
+    FactorDiff,
     FacelessStyle,
     Look,
     Platform,
@@ -271,6 +272,145 @@ def test_suggest_without_an_eligible_parent_is_422_naming_the_floor(tmp_path):
     assert "3 completed videos" in response.json()["detail"]
     assert [row.id for row in store.list_experiments()] == ["exp-lone"]
     assert list(tmp_path.rglob("*.mp4")) == []
+
+
+def test_an_accepted_draft_keeps_its_parent_and_derived_factor_list(tmp_path):
+    """US-031: accepting a draft stores its lineage. The factor list is what
+    the server derived from the parent with changed_factors, and the child's
+    own tracking code never reads as a money change."""
+    store = open_store(tmp_path)
+    _series(store)
+    store.insert_experiment(experiment(id="exp-parent"))
+    with TestClient(create_app(store)) as client:
+        created = client.post(
+            "/experiments",
+            json=experiment_body(
+                id="exp-child",
+                parent_ids=["exp-parent"],
+                style={"kind": "avatar", "presenter_id": "presenter-1", "voice_id": "voice-1"},
+                money={"kind": "affiliate", "tracking_code": "abc-c2", "merchant": "acme"},
+            ),
+        )
+    assert created.status_code == 200, created.text
+    assert created.json()["parent_ids"] == ["exp-parent"]
+    assert created.json()["factor_diffs"] == [
+        {
+            "field": "style",
+            "parent_value": "faceless/stills/voice-1/bold",
+            "next_value": "avatar/presenter-1/voice-1",
+        }
+    ]
+    stored = store.get_experiment("exp-child")
+    assert stored.parent_ids == ("exp-parent",)
+    assert stored.factor_diffs == (
+        FactorDiff(
+            field="style",
+            parent_value="faceless/stills/voice-1/bold",
+            next_value="avatar/presenter-1/voice-1",
+        ),
+    )
+
+
+def test_a_declared_factor_list_is_advisory_only(tmp_path):
+    """US-031: the body's declared diffs are never stored. The draft below
+    claims a hook change; the server derives the style change it really made."""
+    store = open_store(tmp_path)
+    _series(store)
+    store.insert_experiment(experiment(id="exp-parent"))
+    with TestClient(create_app(store)) as client:
+        created = client.post(
+            "/experiments",
+            json=experiment_body(
+                id="exp-child",
+                parent_ids=["exp-parent"],
+                factor_diffs=[
+                    {"field": "hook", "parent_value": "question", "next_value": "result"}
+                ],
+                style={"kind": "avatar", "presenter_id": "presenter-1", "voice_id": "voice-1"},
+                money={"kind": "affiliate", "tracking_code": "abc-c2", "merchant": "acme"},
+            ),
+        )
+    assert created.status_code == 200, created.text
+    stored = store.get_experiment("exp-child")
+    assert [diff.field for diff in stored.factor_diffs] == ["style"]
+    assert stored.factor_diffs == (
+        FactorDiff(
+            field="style",
+            parent_value="faceless/stills/voice-1/bold",
+            next_value="avatar/presenter-1/voice-1",
+        ),
+    )
+
+
+def test_an_unknown_parent_is_refused_with_nothing_written(tmp_path):
+    """US-031: parent_ids are stored as given but validated; a name the lab
+    does not know is a 422 naming it, and the refusal writes nothing."""
+    store = open_store(tmp_path)
+    _series(store)
+    with TestClient(create_app(store)) as client:
+        response = client.post(
+            "/experiments",
+            json=experiment_body(parent_ids=["exp-ghost"]),
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "unknown parent exp-ghost"
+    assert store.list_experiments() == []
+    assert list(tmp_path.rglob("*.storyboard.json")) == []
+
+
+def test_derived_diffs_name_every_moved_factor(tmp_path):
+    """US-031: changed_factors names the five synthesis factors; a draft
+    that moves four of them records each one's values on either side."""
+    store = open_store(tmp_path)
+    _series(store)
+    _series(store, "niche-2")
+    store.insert_experiment(
+        experiment(
+            id="exp-parent",
+            money=PlatformPayout(platform=Platform.tiktok),
+            length_sec=75,
+        )
+    )
+    with TestClient(create_app(store)) as client:
+        created = client.post(
+            "/experiments",
+            json=experiment_body(
+                id="exp-child",
+                parent_ids=["exp-parent"],
+                niche_id="niche-2",
+                hook_id="result",
+                length_sec=45,
+                money={"kind": "affiliate", "tracking_code": "abc-c2", "merchant": "acme"},
+            ),
+        )
+    assert created.status_code == 200, created.text
+    assert created.json()["factor_diffs"] == [
+        {"field": "niche", "parent_value": "niche-1", "next_value": "niche-2"},
+        {"field": "money", "parent_value": "platform_payout/tiktok", "next_value": "affiliate/acme"},
+        {"field": "hook", "parent_value": "question", "next_value": "result"},
+        {"field": "length", "parent_value": "75", "next_value": "45"},
+    ]
+
+
+def test_results_carry_lineage_for_rows_with_diffs(tmp_path):
+    """US-031: Results can name the factor that moved only if the payload
+    carries the stored lineage, so _experiment_json exposes both fields."""
+    store = open_store(tmp_path)
+    _series(store)
+    store.insert_experiment(
+        experiment(
+            id="exp-child",
+            parent_ids=("exp-parent",),
+            factor_diffs=(FactorDiff(field="style", parent_value="faceless", next_value="avatar"),),
+        )
+    )
+    with TestClient(create_app(store)) as client:
+        rows = client.get("/results").json()
+    row = next(item for item in rows if item["id"] == "exp-child")
+    assert row["parent_ids"] == ["exp-parent"]
+    assert row["factor_diffs"] == [
+        {"field": "style", "parent_value": "faceless", "next_value": "avatar"}
+    ]
 
 
 def test_starter_inserts_drafts_without_rendering(tmp_path):

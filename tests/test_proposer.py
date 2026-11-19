@@ -458,6 +458,34 @@ def test_parent_views_include_avatar_and_each_money_path():
     assert catalog_ids["niche_ids"] == ["niche-1"]
 
 
+def test_list_finished_excludes_rows_below_the_sample_floor():
+    """US-027 on the real path: a finished row in a thin cell is invisible
+    to the proposer, exactly as the fallback ranker skips it."""
+    rich_thin = experiment(
+        id="thin", status=Status.complete, revenue_cents=999, niche_id="niche-2"
+    )
+    supported = experiment(id="fat", status=Status.complete, revenue_cents=1)
+    rows = [rich_thin, supported] + [
+        experiment(id=f"fat-sib-{n}", status=Status.complete, style=supported.style, money=supported.money)
+        for n in (1, 2)
+    ]
+    catalog = _catalog(parents={row.id: row for row in rows})
+    tools = _tools(make_tools(ProposeRun(experiments=tuple(rows), catalog=catalog)))
+    finished_ids = [row["id"] for row in json.loads(tools["list_finished"].invoke({}))]
+    # Score order: revenue, then clicks, then id descending.
+    assert finished_ids == ["fat", "fat-sib-2", "fat-sib-1"]
+
+
+def test_a_below_floor_parent_is_refused_at_submit():
+    """The model cannot smuggle a thin-cell parent past _evaluate."""
+    parent = experiment(id="exp-parent", status=Status.complete)
+    rows = [parent]
+    catalog = _catalog(parents={row.id: row for row in rows})
+    tools = _tools(make_tools(ProposeRun(experiments=tuple(rows), catalog=catalog)))
+    message = tools["submit_draft"].invoke(_draft(parent_ids=["exp-parent"]))
+    assert "below the sample floor" in message
+
+
 def test_default_client_and_agent_construct_without_a_request():
     model = chat_from_env(
         {

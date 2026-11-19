@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 from deadinternet.api.app import create_app
-from deadinternet.domain.experiment import Affiliate, Status
+from deadinternet.domain.experiment import Affiliate, FactorDiff, Status
 from tests.helpers import experiment, open_store
 
 
@@ -125,5 +125,36 @@ def test_flow_from_starter_grid_to_a_draft_proposal(tmp_path):
     assert len(drafts[0]["factor_diffs"]) == 1
     after = {row["id"] for row in client.get("/experiments").json()}
     assert after == before
+
+    # US-031: accepting the suggestion keeps its lineage. The stored factor
+    # list is what the server derived from the parent, not the declared one.
+    draft = drafts[0]
+    accepted = client.post(
+        "/experiments",
+        json={
+            "niche_id": draft["niche_id"],
+            "hook_id": draft["hook_id"],
+            "hypothesis": draft["hypothesis"],
+            "script": draft["script"],
+            "caption": draft["caption"],
+            "length_sec": draft["length_sec"],
+            "style": draft["style"],
+            "money": draft["money"],
+            "parent_ids": draft["parent_ids"],
+            "factor_diffs": draft["factor_diffs"],
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    child_id = accepted.json()["id"]
+    child = store.get_experiment(child_id)
+    assert child.parent_ids == (experiment_id,)
+    assert child.factor_diffs == (
+        FactorDiff(
+            field="style",
+            parent_value="faceless/stills/voice-1/bold",
+            next_value="avatar/presenter-1/voice-1",
+        ),
+    )
+    assert {row["id"] for row in client.get("/experiments").json()} == after | {child_id}
     suggested_files = list(tmp_path.rglob("*.mp4"))
     assert suggested_files == []

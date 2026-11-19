@@ -5,6 +5,7 @@ import pytest
 
 from deadinternet.domain.experiment import (
     AvatarStyle,
+    Beat,
     FacelessStyle,
     Look,
     Platform,
@@ -18,6 +19,7 @@ from deadinternet.publish.registry import PublishRefused, publish
 from deadinternet.render.faceless import render_faceless
 from deadinternet.render.registry import render
 from deadinternet.runtime import LivePublisher, LiveRenderer
+from deadinternet.storyboard import write_storyboard
 from tests.helpers import experiment
 
 
@@ -186,6 +188,15 @@ def test_live_avatar_render_fails_without_a_provider(tmp_path, monkeypatch):
     assert "AVATAR_API_KEY" in (rendered.render_error or "")
 
 
+def test_live_faceless_render_fails_without_tts(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEADINTERNET_TTS_API_KEY", raising=False)
+    row = experiment(status=Status.rendering)
+    write_storyboard(tmp_path / f"{row.id}.storyboard.json", (Beat(spoken="Line one."),))
+    rendered = LiveRenderer().render(row, tmp_path)
+    assert rendered.status is Status.render_failed
+    assert "DEADINTERNET_TTS_API_KEY" in (rendered.render_error or "")
+
+
 def test_live_publisher_without_a_token_packs_a_manual_post():
     row = experiment(status=Status.approved, file_path="clip.mp4")
     result = LivePublisher().publish(row, Platform.tiktok, "acct-1", token=None)
@@ -239,5 +250,6 @@ def test_store_creates_missing_data_directories_for_an_absolute_path(tmp_path):
     from deadinternet.store import Store
 
     target = tmp_path / "elsewhere" / "data" / "deadinternet.sqlite"
-    Store(str(target))
+    store = Store(str(target))
     assert target.is_file()
+    store.close()
