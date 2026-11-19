@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,7 @@ from deadinternet.domain.experiment import (
     Style,
     Theme,
 )
-from deadinternet.domain.proposal import Catalog
+from deadinternet.domain.proposal import Catalog, mint_tracking_code
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS themes (
@@ -129,6 +130,25 @@ CREATE TABLE IF NOT EXISTS snapshots (
     comments INTEGER NOT NULL,
     shares INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS revenue_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS revenue_ledger_experiment ON revenue_ledger (experiment_id);
+
+CREATE TABLE IF NOT EXISTS clicks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tracking_code TEXT NOT NULL,
+    experiment_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS clicks_experiment ON clicks (experiment_id);
 """
 
 
@@ -287,6 +307,39 @@ class Store:
         self._migrate_legacy_niches()
         self._conn.executescript(_SCHEMA)
         self._ensure_board_hash()
+        self._ensure_unique_tracking_codes()
+        self._ensure_click_log()
+
+    def _ensure_click_log(self) -> None:
+        """US-025: the counter and the log must agree. Clicks recorded before
+        the log existed have no rows; each missing row is backfilled as one
+        synthetic click stamped at migration time, so the counter always
+        equals the log count without touching the counter. Idempotent."""
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            for row in self._conn.execute(
+                """
+                SELECT id,
+                       json_extract(money_json, '$.tracking_code') AS code,
+                       clicks
+                FROM experiments
+                """
+            ).fetchall():
+                logged = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM clicks WHERE experiment_id = ?",
+                    (row["id"],),
+                ).fetchone()["n"]
+                missing = int(row["clicks"]) - int(logged)
+                if missing > 0:
+                    self._conn.executemany(
+                        "INSERT INTO clicks (tracking_code, experiment_id, created_at) VALUES (?, ?, ?)",
+                        ((row["code"] or "", row["id"], stamp),) * missing,
+                    )
+
+    def close(self) -> None:
+        """Tests close their stores so no sqlite handle outlives them; the
+        app itself shares one long-lived connection."""
+        self._conn.close()
 
     def _column_names(self, table: str) -> set[str]:
         row = self._conn.execute(
@@ -324,6 +377,54 @@ class Store:
         if columns and "board_hash" not in columns:
             self._conn.execute("ALTER TABLE experiments ADD COLUMN board_hash TEXT")
             self._conn.commit()
+
+    def _ensure_unique_tracking_codes(self) -> None:
+        """One video, one code (US-024).
+
+        A legacy database may already hold duplicate codes. No row is
+        deleted: the earliest row keeps the code and every later duplicate
+        is renamed with a `-2`/`-3` suffix, then a unique index refuses any
+        new duplicate at the store level. An empty code means "no tracking"
+        and never takes part.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT rowid AS rid, json_extract(money_json, '$.tracking_code') AS code
+            FROM experiments
+            WHERE json_extract(money_json, '$.tracking_code') IS NOT NULL
+              AND json_extract(money_json, '$.tracking_code') != ''
+            ORDER BY rowid
+            """
+        ).fetchall()
+        taken = {row["code"] for row in rows}
+        kept: set[str] = set()
+        renames: list[tuple[str, int]] = []
+        for row in rows:
+            code = row["code"]
+            if code in kept:
+                fresh = mint_tracking_code(code, taken)
+                taken.add(fresh)
+                renames.append((fresh, row["rid"]))
+                continue
+            kept.add(code)
+        with self._conn:
+            for fresh, rid in renames:
+                self._conn.execute(
+                    """
+                    UPDATE experiments
+                    SET money_json = json_set(money_json, '$.tracking_code', ?)
+                    WHERE rowid = ?
+                    """,
+                    (fresh, rid),
+                )
+            self._conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS experiments_tracking_code
+                ON experiments (json_extract(money_json, '$.tracking_code'))
+                WHERE json_extract(money_json, '$.tracking_code') IS NOT NULL
+                  AND json_extract(money_json, '$.tracking_code') != ''
+                """
+            )
 
     def upsert_theme(self, id: str, name: str, language: str = "en") -> None:
         self._write(
@@ -483,8 +584,9 @@ class Store:
         return _experiment_from_row(row)
 
     def save_experiment(self, experiment: Experiment) -> None:
-        # clicks and revenue_cents are owned by add_click and add_revenue
-        # alone: a save from a stale in-memory copy must never erase them.
+        # clicks and revenue_cents are owned by add_click and
+        # record_revenue alone: a save from a stale in-memory copy must
+        # never erase them.
         self._require_experiment(experiment.id)
         self._write(
             """
@@ -658,7 +760,7 @@ class Store:
                    likes, comments, shares
             FROM snapshots
             WHERE publication_id = ?
-            ORDER BY id
+            ORDER BY captured_at, id
             """,
             (publication_id,),
         ).fetchall()
@@ -676,25 +778,57 @@ class Store:
         ]
 
     def add_click(self, tracking_code: str) -> int:
-        cur = self._conn.execute(
-            """
-            UPDATE experiments
-            SET clicks = clicks + 1
-            WHERE id = (
-                SELECT id FROM experiments
-                WHERE json_extract(money_json, '$.tracking_code') = ?
-                LIMIT 1
+        """Increment the counter and append one log row in a single transaction.
+
+        With unique tracking codes the subquery matches exactly one row, so
+        the click credits the video that earned it. If the INSERT throws, the
+        UPDATE rolls back with it instead of waiting in an open transaction
+        for the next write to commit it.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                UPDATE experiments
+                SET clicks = clicks + 1
+                WHERE id = (
+                    SELECT id FROM experiments
+                    WHERE json_extract(money_json, '$.tracking_code') = ?
+                    LIMIT 1
+                )
+                RETURNING id, clicks
+                """,
+                (tracking_code,),
             )
-            RETURNING clicks
-            """,
-            (tracking_code,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            self._conn.rollback()
-            raise KeyError(tracking_code)
-        self._conn.commit()
+            row = cur.fetchone()
+            if row is None:
+                raise KeyError(tracking_code)
+            self._conn.execute(
+                """
+                INSERT INTO clicks (tracking_code, experiment_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (tracking_code, row["id"], datetime.now(timezone.utc).isoformat()),
+            )
         return int(row["clicks"])
+
+    def list_click_times(self, experiment_id: str) -> list[str]:
+        """Timestamps of every logged click for one experiment, oldest first."""
+        rows = self._conn.execute(
+            "SELECT created_at FROM clicks WHERE experiment_id = ? ORDER BY id",
+            (experiment_id,),
+        ).fetchall()
+        return [row["created_at"] for row in rows]
+
+    def mint_tracking_code(self, desired: str) -> str:
+        """`desired`, or a `-2`/`-3` variant no stored experiment carries."""
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT json_extract(money_json, '$.tracking_code') AS code
+            FROM experiments
+            """
+        ).fetchall()
+        taken = {row["code"] for row in rows if row["code"]}
+        return mint_tracking_code(desired, taken)
 
     def add_revenue(self, experiment_id: str, cents: int) -> None:
         self._require_experiment(experiment_id)
@@ -706,6 +840,49 @@ class Store:
             """,
             (cents, experiment_id),
         )
+
+    def record_revenue(
+        self, experiment_id: str, amount_cents: int, note: str, created_at: str
+    ) -> dict:
+        """Raise the total and append one ledger row in a single transaction
+        (US-026). Two separate commits could leave the total raised with no
+        ledger row behind it; here both land or neither does."""
+        self._require_experiment(experiment_id)
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE experiments
+                SET revenue_cents = revenue_cents + ?
+                WHERE id = ?
+                """,
+                (int(amount_cents), experiment_id),
+            )
+            cur = self._conn.execute(
+                """
+                INSERT INTO revenue_ledger (experiment_id, amount_cents, note, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (experiment_id, int(amount_cents), note or "", created_at),
+            )
+        return {
+            "id": int(cur.lastrowid),
+            "experiment_id": experiment_id,
+            "amount_cents": int(amount_cents),
+            "note": note or "",
+            "created_at": created_at,
+        }
+
+    def list_revenue_entries(self, experiment_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            """
+            SELECT id, experiment_id, amount_cents, note, created_at
+            FROM revenue_ledger
+            WHERE experiment_id = ?
+            ORDER BY id DESC
+            """,
+            (experiment_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def catalog(self) -> Catalog:
         offer_ids: set[str] = set()

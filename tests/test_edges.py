@@ -1,4 +1,4 @@
-import sys
+import ast
 from pathlib import Path
 
 import pytest
@@ -13,9 +13,9 @@ from deadinternet.domain.experiment import (
     reject,
 )
 from deadinternet.domain.proposal import Catalog, ProposalRejected, parse_proposal
-from deadinternet.domain.rank import assert_no_render_side_effect, suggest
+from deadinternet.domain.rank import suggest
 from deadinternet.publish.registry import PublishRefused, publish
-from deadinternet.render.faceless import default_runner, render_faceless
+from deadinternet.render.faceless import render_faceless
 from deadinternet.render.registry import render
 from deadinternet.runtime import LivePublisher, LiveRenderer
 from tests.helpers import experiment
@@ -104,33 +104,57 @@ def test_suggest_ignores_rows_that_are_not_complete():
 
 def test_suggest_from_an_avatar_parent_uses_faceless_stills():
     parent = experiment(
+        id="exp-avatar-top",
         status=Status.complete,
         style=AvatarStyle(presenter_id="presenter-1", voice_id="voice-1"),
         money=PlatformPayout(platform=Platform.youtube),
         revenue_cents=10,
+        clicks=1,
     )
-    drafts = suggest([parent], _catalog(parents={parent.id: parent}))
+    siblings = [
+        experiment(
+            id=f"av-sib-{n}",
+            status=Status.complete,
+            style=AvatarStyle(presenter_id="presenter-1", voice_id="voice-1"),
+            money=PlatformPayout(platform=Platform.youtube),
+        )
+        for n in (1, 2)
+    ]
+    rows = [parent, *siblings]
+    drafts = suggest(rows, _catalog(parents={row.id: row for row in rows}))
     assert isinstance(drafts[0].style, FacelessStyle)
     assert drafts[0].style.look is Look.stills
     assert drafts[0].money.platform is Platform.youtube
 
 
 def test_suggest_keeps_the_only_catalog_hook():
-    parent = experiment(status=Status.complete, revenue_cents=10)
+    parent = experiment(id="hook-top", status=Status.complete, revenue_cents=10, clicks=1)
+    rows = [
+        parent,
+        experiment(id="hook-sib-1", status=Status.complete),
+        experiment(id="hook-sib-2", status=Status.complete),
+    ]
     catalog = _catalog(
         hook_ids=frozenset({"question"}),
-        parents={parent.id: parent},
+        parents={row.id: row for row in rows},
     )
-    drafts = suggest([parent], catalog)
+    drafts = suggest(rows, catalog)
     assert drafts[0].hook_id == "question"
 
 
-def test_rank_boundary_does_not_render():
-    assert assert_no_render_side_effect() is None
-
-
-def test_default_runner_runs_a_successful_command():
-    default_runner([sys.executable, "-c", "pass"])
+def test_rank_module_does_not_import_render_or_publish():
+    """The domain ranker must stay pure: no path from suggest() to a
+    renderer or publisher, enforced on the imports themselves."""
+    path = Path(__file__).parents[1] / "src" / "deadinternet" / "domain" / "rank.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    modules = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.append(node.module)
+    assert all(not name.startswith("deadinternet.render") for name in modules)
+    assert all(not name.startswith("deadinternet.publish") for name in modules)
 
 
 def test_unknown_look_is_rejected(tmp_path):

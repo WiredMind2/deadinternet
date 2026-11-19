@@ -3,7 +3,7 @@
 import json
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -17,7 +17,15 @@ from deadinternet.domain.experiment import (
     Status,
     Style,
 )
-from deadinternet.domain.proposal import Catalog, DraftSpec, ProposalRejected, parse_proposal
+from deadinternet.domain.proposal import (
+    Catalog,
+    DraftSpec,
+    ProposalRejected,
+    child_tracking_code,
+    mint_tracking_code,
+    parse_proposal,
+)
+from deadinternet.domain.rank import eligible_parents
 from deadinternet.propose.lint import draft_problems
 
 MAX_STEPS = 12
@@ -30,11 +38,13 @@ USER_AGENT = (
 SYSTEM_PROMPT = """
 You propose the next short vertical video experiment for this lab.
 Pick the parent with the highest revenue_cents, then clicks, then id.
-Change a real factor. Use only ids from get_catalog.
+Change exactly one factor per draft: style, hook, money path, length, or niche. Never more than one.
+Use only ids from get_catalog.
 Read the parent script before you write. The new script must not be a near-copy.
 A near-copy is the same script and the same look.
+Keep the parent's money path; the lab derives the child's own tracking code.
 Call validate_draft before submit_draft. Repair any rejection, then submit once.
-A rejection may name the hook score, the caption fold, or stock phrases. Fix what it names.
+A rejection may name the hook score, the caption fold, stock phrases, or the factor list. Fix what it names.
 Submit exactly one draft.
 A TikTok Creator Rewards video must be longer than 60 seconds.
 Do not render or post.
@@ -170,8 +180,8 @@ class RepairProposer:
 def make_tools(run: ProposeRun):
     @tool
     def list_finished() -> str:
-        """List completed experiments. Scores are revenue_cents, then clicks, then id. Scripts are omitted."""
-        rows = [row for row in run.experiments if row.status is Status.complete]
+        """List finished experiments eligible to be a parent: their cell reached the sample floor. Scores are revenue_cents, then clicks, then id. Scripts are omitted."""
+        rows = eligible_parents(list(run.experiments))
         rows.sort(key=lambda row: (row.revenue_cents, row.clicks, row.id), reverse=True)
         payload = [
             {
@@ -320,14 +330,53 @@ def _raw_draft(
 
 
 def _evaluate(run: ProposeRun, raw: dict) -> tuple[DraftSpec | None, str]:
+    # A parentless draft would skip the one-factor rule and the near-copy
+    # check, so it is refused outright instead of recoded.
+    if not raw.get("parent_ids"):
+        return None, "a draft needs a parent"
     try:
         draft = parse_proposal([raw], run.catalog)[0]
     except (ProposalRejected, KeyError, ValueError, TypeError) as exc:
         return None, str(exc)
+    # catalog.parents holds every experiment whatever its status; only an
+    # eligible parent (complete, cell at the sample floor) can be named.
+    eligible_ids = {row.id for row in eligible_parents(list(run.experiments))}
+    refused = [parent_id for parent_id in draft.parent_ids if parent_id not in eligible_ids]
+    if refused:
+        return None, f"parent {refused[0]} is below the sample floor; pick a parent from list_finished"
     problems = draft_problems(draft)
     if problems:
         return None, " ".join(problems)
-    return draft, "ok"
+    return _with_own_tracking_code(draft, run), "ok"
+
+
+def _with_own_tracking_code(draft: DraftSpec, run: ProposeRun) -> DraftSpec:
+    """One video, one code (US-024): a submitted child never keeps a code
+    another experiment already owns; it derives `<parent>-c2` instead."""
+    if not isinstance(draft.money, (Affiliate, OwnOffer)) or not draft.money.tracking_code:
+        return draft
+    taken = {
+        row.money.tracking_code
+        for row in run.experiments
+        if isinstance(row.money, (Affiliate, OwnOffer)) and row.money.tracking_code
+    }
+    if draft.money.tracking_code not in taken:
+        return draft
+    parent_code = next(
+        (
+            run.catalog.parents[parent_id].money.tracking_code
+            for parent_id in draft.parent_ids
+            if parent_id in run.catalog.parents
+            and isinstance(run.catalog.parents[parent_id].money, (Affiliate, OwnOffer))
+            and run.catalog.parents[parent_id].money.tracking_code
+        ),
+        None,
+    )
+    if parent_code is not None:
+        code = child_tracking_code(parent_code, taken)
+    else:
+        code = mint_tracking_code(draft.money.tracking_code, taken)
+    return replace(draft, money=replace(draft.money, tracking_code=code))
 
 
 def _style_dict(style: Style) -> dict:

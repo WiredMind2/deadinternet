@@ -1,14 +1,25 @@
+from dataclasses import replace
+
 from deadinternet.domain.experiment import (
+    Affiliate,
     AvatarStyle,
     Beat,
     Experiment,
     FacelessStyle,
     Look,
+    OwnOffer,
     Status,
     script_from_beats,
     style_key,
 )
-from deadinternet.domain.proposal import Catalog, DraftSpec, FactorDiff, ProposalRejected, parse_proposal
+from deadinternet.domain.proposal import (
+    Catalog,
+    DraftSpec,
+    FactorDiff,
+    ProposalRejected,
+    child_tracking_code,
+    parse_proposal,
+)
 
 
 SAMPLE_FLOOR = 3
@@ -28,26 +39,34 @@ def below_sample_floor(count: int, floor: int = SAMPLE_FLOOR) -> bool:
     return count < floor
 
 
+def eligible_parents(rows: list[Experiment]) -> list[Experiment]:
+    """Decision 4: a cell below the sample floor cannot name a cause, so a
+    thin-cell row is never the parent. A row is eligible only when it is
+    complete and its cell has reached the floor."""
+    return [
+        row
+        for row in rows
+        if row.status is Status.complete
+        and not below_sample_floor(cell_size(rows, row))
+    ]
+
+
 def suggest(completed: list[Experiment], catalog: Catalog) -> list[DraftSpec]:
-    finished = [row for row in completed if row.status is Status.complete]
-    if not finished:
+    eligible = eligible_parents(completed)
+    if not eligible:
         return []
-    parent = max(finished, key=lambda row: (row.revenue_cents, row.clicks, row.id))
+    parent = max(eligible, key=lambda row: (row.revenue_cents, row.clicks, row.id))
     next_style = _other_style(parent, catalog)
-    next_hook = _other_hook(parent.hook_id, catalog)
-    diffs = (
-        FactorDiff("style", style_key(parent.style)[0], style_key(next_style)[0]),
-        FactorDiff("hook_id", parent.hook_id, next_hook),
-    )
+    diffs = (FactorDiff("style", style_key(parent.style)[0], style_key(next_style)[0]),)
     beats = (Beat(spoken=f"Follow-up script distinct from {parent.id}.", on_screen="", visual_note=""),)
     draft = DraftSpec(
         parent_ids=(parent.id,),
         factor_diffs=diffs,
         niche_id=parent.niche_id,
         style=next_style,
-        money=parent.money,
-        hook_id=next_hook,
-        hypothesis=f"Change style and hook after {parent.id}",
+        money=_child_money(parent, completed),
+        hook_id=parent.hook_id,
+        hypothesis=f"Change style after {parent.id}",
         script=script_from_beats(beats),
         caption=parent.caption,
         length_sec=parent.length_sec,
@@ -60,6 +79,20 @@ def _money_key(row: Experiment) -> str:
     return row.money.kind
 
 
+def _child_money(parent: Experiment, rows: list[Experiment]):
+    """One video, one code (US-024): a child derives `<parent>-c2` and never
+    reuses the parent's exact code, so child clicks never credit the parent."""
+    code = getattr(parent.money, "tracking_code", None)
+    if not code:
+        return parent.money
+    taken = {
+        row.money.tracking_code
+        for row in rows
+        if isinstance(row.money, (Affiliate, OwnOffer)) and row.money.tracking_code
+    }
+    return replace(parent.money, tracking_code=child_tracking_code(code, taken))
+
+
 def _other_style(parent: Experiment, catalog: Catalog):
     if isinstance(parent.style, FacelessStyle):
         if not catalog.presenter_ids:
@@ -67,13 +100,6 @@ def _other_style(parent: Experiment, catalog: Catalog):
         presenter_id = sorted(catalog.presenter_ids)[0]
         return AvatarStyle(presenter_id=presenter_id, voice_id=parent.style.voice_id)
     return FacelessStyle(look=Look.stills, voice_id=parent.style.voice_id, caption_style="bold")
-
-
-def _other_hook(current: str, catalog: Catalog) -> str:
-    for hook_id in sorted(catalog.hook_ids):
-        if hook_id != current:
-            return hook_id
-    return current
 
 
 def _to_raw(draft: DraftSpec) -> dict:
@@ -123,14 +149,11 @@ def _to_raw(draft: DraftSpec) -> dict:
     }
 
 
-def assert_no_render_side_effect() -> None:
-    """suggest() has no path to a renderer. This function exists so tests can import the boundary."""
-    return None
-
-
 __all__ = [
     "ProposalRejected",
+    "SAMPLE_FLOOR",
     "below_sample_floor",
     "cell_size",
+    "eligible_parents",
     "suggest",
 ]

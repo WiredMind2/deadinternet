@@ -1,9 +1,14 @@
 from deadinternet.domain.experiment import Affiliate, Experiment, FacelessStyle, Look, Status
 from deadinternet.store import Store
 
+# Stores opened by tests, closed by the autouse fixture in conftest.py.
+OPENED_STORES: list[Store] = []
+
 
 def open_store(tmp_path):
-    return Store(str(tmp_path / "lab.sqlite"))
+    store = Store(str(tmp_path / "lab.sqlite"))
+    OPENED_STORES.append(store)
+    return store
 
 
 def experiment(**overrides) -> Experiment:

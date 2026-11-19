@@ -30,21 +30,62 @@ index and `archive/` before minting a new one.
 | US-021 | Dashboard form input correctness | 5 | Done |
 | US-022 | Dashboard error and state hygiene | 3 | Done |
 | US-023 | Saving an experiment never erases clicks or revenue | 1 | Done |
+| US-024 | Every video gets its own tracking code | 5 | Done |
+| US-025 | Clicks are a log the measurement window can read | 3 | Done |
+| US-026 | Record payouts and revenue | 5 | Done |
+| US-027 | The ranker learns honestly | 5 | Done |
+| US-030 | Record the full snapshot and see the trend | 3 | Done |
+| US-031 | Accepted drafts keep their parent and factor list | 3 | Ready |
+| US-032 | Faceless stills render speaks each beat | 5 | Ready |
+| US-033 | Burned-in captions from beat on-screen text | 3 | Ready |
+| US-034 | Public read-only click app | 3 | Ready |
+| US-035 | The window starts at the first post, on the server clock | 2 | Ready |
+| US-036 | Money paths are scored apart | 3 | Ready |
+| US-037 | Correct a payout with a reversal | 2 | Ready |
+| US-038 | Snapshots honest about gaps | 2 | Ready |
+| US-039 | Show which legacy codes the migration renamed | 1 | Ready |
+| US-040 | The Post tab never hides the live publication behind a stale one | 1 | Ready |
+
+## Retired ids
+
+US-028 and US-029 were never minted as story files in this repo; the ids
+are retired so no future story can collide with references to them.
 
 ## Backlog (next waves, not yet started)
 
-Wave 2 — make the score exist and be honest (from the claude-opus reflexion of
-2026-11-19, pending story files): every video gets its own tracking code
-(unique index + suggest mints a child code); a click log with timestamps so
-Results can honor the measurement window; payout/revenue entry (route +
-ledger + dashboard form); honest ranker (sample floor respected by suggest,
-one factor change per draft, no closing before the window ends).
+Wave 2 landed on main 2026-11-19: unique tracking codes with a legacy-safe
+migration, a click log the measurement window reads, the revenue ledger
+with routes and a dashboard form, the sample-floor ranker with one-factor
+drafts and a window-guarded complete, and full snapshot fields with
+readback. The claude-opus landing review (saved beside this register as
+`opus-reflexion-2026-11-19-wave2.md`) found the loose ends and they were
+fixed in the same landing: the LLM proposer path now respects the sample
+floor and refuses parentless drafts, `/suggest` explains itself with a 422
+when every cell is thin, the dashboard offers the complete-early override
+and shows windowed clicks, the revenue route is one transaction, the click
+counter and log are atomic (legacy counters backfilled at startup),
+snapshots order by `captured_at`, clash errors name the tracking code, a
+crashing renderer lands in `render_failed` instead of stranding `rendering`,
+own-offer URLs must be http(s) and codes must be URL-safe on every creation
+path, approve refuses an unparseable clock, and the test suite was
+hardened (clock-independent flow test, window-boundary and factor-matrix
+coverage, connection cleanup via `Store.close()` + conftest). The whole
+operator loop was verified in the browser on a temp lab: grid → board →
+render → approve → publish → the 409 naming the window end with the
+override → payout ledger → results with windowed clicks and the floor
+note → the 422 on thin suggest.
 
-Wave 3 — make something worth scoring: faceless render with per-beat speech
-and burned-in captions; a public read-only /r/ click app separate from the
-admin API. Explicitly deferred per the reflexion: auto-posting clients, the
-avatar provider, a smarter LLM proposer, bandit statistics, stock-footage
-clips, splitting App.jsx, an ORM, a scheduler.
+Wave 3 — make something worth scoring and keep the operator honest:
+US-031 (lineage on accepted drafts), US-032 and US-033 (faceless render
+with per-beat speech and burned-in captions), US-034 (public read-only
+/r/ click app). Honesty follow-ups: US-035 (window anchored to the first
+post, server clock), US-036 (money paths scored apart), US-037 (payout
+reversals), US-038 (absent vs zero snapshots), US-039 (migration renames
+surfaced), US-040 (stale publication on Post). Explicitly deferred per
+the reflexion: auto-posting clients, the avatar provider, a smarter LLM
+proposer, bandit statistics, stock-footage clips, splitting App.jsx, an
+ORM, a scheduler. The cell not controlling for hook and length (review
+finding G6) waits until US-031 stores lineage.
 
 ## Collisions
 

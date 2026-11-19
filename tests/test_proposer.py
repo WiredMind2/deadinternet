@@ -6,7 +6,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from deadinternet.api.app import create_app
-from deadinternet.domain.experiment import AvatarStyle, OwnOffer, Platform, PlatformPayout, Status
+from deadinternet.domain.experiment import (
+    Affiliate,
+    AvatarStyle,
+    OwnOffer,
+    Platform,
+    PlatformPayout,
+    Status,
+)
 from deadinternet.domain.proposal import Catalog
 from deadinternet.propose.agent import (
     MAX_STEPS,
@@ -51,7 +58,8 @@ def _draft(**overrides) -> dict:
         "hypothesis": "A result hook beats the question hook.",
         "script": "I lost $18,000 on one missing contract.",
         "caption": "That contract cost me $18,000.",
-        "length_sec": 75,
+        # Same length as the parent: the hook is the one deliberate change.
+        "length_sec": 45,
     }
     body.update(overrides)
     return body
@@ -59,6 +67,17 @@ def _draft(**overrides) -> dict:
 
 def _tools(tools):
     return {item.name: item for item in tools}
+
+
+def _cell(parent):
+    """The parent plus the finished siblings its cell needs to reach the
+    sample floor (US-027): a thin cell cannot name a cause, so a lone parent
+    is not an eligible one."""
+    return [
+        parent,
+        experiment(id=f"{parent.id}-sib-1", status=Status.complete, style=parent.style, money=parent.money),
+        experiment(id=f"{parent.id}-sib-2", status=Status.complete, style=parent.style, money=parent.money),
+    ]
 
 
 def _seed(tmp_path):
@@ -78,6 +97,15 @@ def _seed(tmp_path):
             clicks=4,
         )
     )
+    # The parent's cell needs its floor of finished rows (US-027).
+    for n in (1, 2):
+        store.insert_experiment(
+            experiment(
+                id=f"exp-sib-{n}",
+                status=Status.complete,
+                money=Affiliate(tracking_code=f"sib-{n}", merchant="acme"),
+            )
+        )
     return store
 
 
@@ -99,7 +127,11 @@ def test_repair_then_submit_keeps_the_first_draft():
     def runner(_model, tools, prompt, _run):
         assert "validate_draft" in prompt
         by_name = _tools(tools)
-        seen["rejected"] = by_name["validate_draft"].invoke(_draft(niche_id="missing-niche"))
+        # A parentless draft is refused outright now, so the catalog
+        # rejection is reached with a parent named.
+        seen["rejected"] = by_name["validate_draft"].invoke(
+            _draft(parent_ids=[parent.id], niche_id="missing-niche")
+        )
         seen["submitted"] = by_name["submit_draft"].invoke(
             _draft(parent_ids=[parent.id], script="I lost $18,000 on one missing contract.")
         )
@@ -107,7 +139,7 @@ def test_repair_then_submit_keeps_the_first_draft():
             _draft(parent_ids=[parent.id], script="A later script that must not replace the first.")
         )
 
-    drafts = RepairProposer(runner=runner, model=object()).propose([parent], catalog)
+    drafts = RepairProposer(runner=runner, model=object()).propose(_cell(parent), catalog)
     assert "unknown niche" in seen["rejected"]
     assert seen["submitted"] == "submitted"
     assert seen["second"] == "already submitted"
@@ -129,7 +161,7 @@ def test_lint_rejection_is_repaired_then_accepted():
             _draft(parent_ids=[parent.id])
         )
 
-    drafts = RepairProposer(runner=runner, model=object()).propose([parent], catalog)
+    drafts = RepairProposer(runner=runner, model=object()).propose(_cell(parent), catalog)
     assert "hook scores" in seen["rejected"]
     assert "rewrite the first spoken beat" in seen["rejected"]
     assert seen["repaired"] == "submitted"
@@ -152,6 +184,80 @@ def test_near_copy_submit_is_not_stored():
     assert "near-copy" in seen["message"]
 
 
+def test_a_two_factor_submit_is_refused_with_a_clear_message():
+    parent = experiment(id="exp-parent", status=Status.complete)
+    catalog = _catalog(parents={parent.id: parent})
+    seen = {}
+
+    def runner(_model, tools, _prompt, _run):
+        by_name = _tools(tools)
+        seen["message"] = by_name["submit_draft"].invoke(
+            _draft(
+                parent_ids=[parent.id],
+                style={"kind": "avatar", "presenter_id": "presenter-1", "voice_id": "voice-1"},
+                hook_id="result",
+            )
+        )
+
+    proposer = RepairProposer(runner=runner, model=object())
+    with pytest.raises(ProposerFailed, match="no draft submitted"):
+        proposer.propose([parent], catalog)
+    assert "one deliberate factor" in seen["message"]
+    assert "style" in seen["message"]
+    assert "hook" in seen["message"]
+
+
+def test_an_accepted_child_gets_its_own_tracking_code():
+    parent = experiment(id="exp-parent", status=Status.complete)
+
+    def runner(_model, tools, _prompt, _run):
+        by_name = _tools(tools)
+        by_name["submit_draft"].invoke(
+            _draft(parent_ids=[parent.id], money={"kind": "affiliate", "tracking_code": "abc", "merchant": "acme"})
+        )
+
+    drafts = RepairProposer(runner=runner, model=object()).propose(
+        _cell(parent), _catalog(parents={parent.id: parent})
+    )
+    # The model copied the parent's code; the lab derives the child's own.
+    assert parent.money.tracking_code == "abc"
+    assert drafts[0].money.tracking_code == "abc-c2"
+
+
+def test_a_parentless_draft_is_refused():
+    """A parentless draft would skip the one-factor rule and the near-copy
+    check, so _evaluate refuses it instead of recoding its code."""
+    parent = experiment(status=Status.complete)
+
+    def runner(_model, tools, _prompt, _run):
+        by_name = _tools(tools)
+        message = by_name["submit_draft"].invoke(_draft())
+        assert message == "a draft needs a parent"
+
+    proposer = RepairProposer(runner=runner, model=object())
+    with pytest.raises(ProposerFailed, match="no draft submitted"):
+        proposer.propose(_cell(parent), _catalog(parents={parent.id: parent}))
+
+
+def test_a_codeless_parent_colliding_with_a_known_code_is_recoded():
+    parent = experiment(
+        id="exp-parent",
+        status=Status.complete,
+        money=PlatformPayout(platform=Platform.youtube),
+    )
+    taken = experiment(id="exp-aff", money=Affiliate(tracking_code="abc", merchant="acme"))
+
+    def runner(_model, tools, _prompt, _run):
+        by_name = _tools(tools)
+        by_name["submit_draft"].invoke(_draft(parent_ids=[parent.id], hook_id="question"))
+
+    drafts = RepairProposer(runner=runner, model=object()).propose(
+        _cell(parent) + [taken], _catalog(parents={parent.id: parent})
+    )
+    # The parent cannot donate a code, so the colliding code is minted fresh.
+    assert drafts[0].money.tracking_code == "abc-2"
+
+
 def test_route_returns_the_repaired_draft_without_writing(tmp_path):
     store = _seed(tmp_path)
 
@@ -159,7 +265,9 @@ def test_route_returns_the_repaired_draft_without_writing(tmp_path):
         by_name = _tools(tools)
         finished = json.loads(by_name["list_finished"].invoke({}))
         parent_id = finished[0]["id"]
-        assert "unknown niche" in by_name["validate_draft"].invoke(_draft(niche_id="missing-niche"))
+        assert "unknown niche" in by_name["validate_draft"].invoke(
+            _draft(parent_ids=[parent_id], niche_id="missing-niche")
+        )
         by_name["submit_draft"].invoke(
             _draft(parent_ids=[parent_id], script="I cut my $140 phone bill to $9 in one call.")
         )
@@ -172,7 +280,11 @@ def test_route_returns_the_repaired_draft_without_writing(tmp_path):
     assert len(body) == 1
     assert body[0]["script"] == "I cut my $140 phone bill to $9 in one call."
     assert body[0]["niche_id"] == "niche-1"
-    assert [row.id for row in store.list_experiments()] == ["exp-parent"]
+    assert [row.id for row in store.list_experiments()] == [
+        "exp-parent",
+        "exp-sib-1",
+        "exp-sib-2",
+    ]
     assert list(tmp_path.rglob("*.mp4")) == []
 
 
@@ -187,7 +299,11 @@ def test_route_returns_502_when_nothing_is_submitted(tmp_path):
         response = client.post("/suggest")
     assert response.status_code == 502
     assert response.json()["detail"] == "no draft submitted"
-    assert [row.id for row in store.list_experiments()] == ["exp-parent"]
+    assert [row.id for row in store.list_experiments()] == [
+        "exp-parent",
+        "exp-sib-1",
+        "exp-sib-2",
+    ]
 
 
 def test_missing_key_is_503_and_builds_no_client(tmp_path):
@@ -279,7 +395,7 @@ def test_graph_error_after_submit_still_returns_the_draft():
 
         return Agent()
 
-    drafts = RepairProposer(model=object(), agent_factory=factory).propose([parent], catalog)
+    drafts = RepairProposer(model=object(), agent_factory=factory).propose(_cell(parent), catalog)
     assert drafts[0].script == "The second cut saved me 40 bucks a month."
 
 
@@ -315,10 +431,21 @@ def test_parent_views_include_avatar_and_each_money_path():
         clicks=3,
         money=OwnOffer(tracking_code="own", offer_url="https://shop.example/offer"),
     )
-    catalog = _catalog(parents={row.id: row for row in (affiliate, payout, own)})
-    tools = _tools(make_tools(ProposeRun(experiments=(affiliate, payout, own), catalog=catalog)))
+    rows = [affiliate, payout, own]
+    # US-027: list_finished names only eligible parents, so each row needs
+    # the finished siblings that lift its cell to the sample floor.
+    siblings = [
+        experiment(id=f"{row.id}-sib-{n}", status=Status.complete, style=row.style, money=row.money)
+        for row in rows
+        for n in (1, 2)
+    ]
+    rows.extend(siblings)
+    catalog = _catalog(parents={row.id: row for row in rows})
+    tools = _tools(make_tools(ProposeRun(experiments=tuple(rows), catalog=catalog)))
     finished = json.loads(tools["list_finished"].invoke({}))
-    assert [row["id"] for row in finished] == ["pay", "own", "aff"]
+    finished_ids = [row["id"] for row in finished]
+    assert finished_ids[:3] == ["pay", "own", "aff"]
+    assert len(finished_ids) == 9
     affiliate_view = json.loads(tools["read_parent"].invoke({"experiment_id": "aff"}))
     assert affiliate_view["money"]["merchant"] == "acme"
     avatar = json.loads(tools["read_parent"].invoke({"experiment_id": "pay"}))

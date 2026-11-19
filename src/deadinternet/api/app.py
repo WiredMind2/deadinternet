@@ -1,9 +1,10 @@
 """HTTP commands for experiments, the click redirect, and metric snapshots."""
 
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -32,6 +33,7 @@ from deadinternet.domain.experiment import (
     approve_board,
     complete,
     mark_posted,
+    mark_render_failed,
     mark_rendered,
     reject,
     request_render,
@@ -54,7 +56,13 @@ from deadinternet.domain.proposal import (
     starter_grid,
 )
 from deadinternet.propose.agent import ProposerFailed, ProposerUnavailable
-from deadinternet.domain.rank import below_sample_floor, cell_size, suggest
+from deadinternet.domain.rank import (
+    SAMPLE_FLOOR,
+    below_sample_floor,
+    cell_size,
+    eligible_parents,
+    suggest,
+)
 from deadinternet.metrics.pull import record_snapshot
 from deadinternet.track.redirect import hit
 
@@ -140,7 +148,7 @@ class ExperimentIn(BaseModel):
     length_sec: int
     proposal_id: str | None = None
     language: str = "en"
-    measurement_window_days: int = 7
+    measurement_window_days: int = Field(default=7, ge=1)
 
 
 class ThemeIn(BaseModel):
@@ -170,6 +178,10 @@ class ApproveIn(BaseModel):
     now: str
 
 
+class CompleteIn(BaseModel):
+    force: bool = False
+
+
 class PublicationIn(BaseModel):
     platform: str
     account_id: str
@@ -197,6 +209,11 @@ class SnapshotIn(BaseModel):
     shares: int = Field(default=0, ge=0)
     captured_at: str | None = None
     failed: bool = False
+
+
+class RevenueIn(BaseModel):
+    amount_cents: int = Field(ge=1)
+    note: str = ""
 
 
 class _ThreadSafeStore:
@@ -363,11 +380,20 @@ def create_app(
         except (KeyError, ValueError, TypeError, UnsafeId) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         _guard_length(experiment)
-        _reject_blank_own_offer_url(experiment)
+        _reject_unusable_own_offer_url(experiment.money)
+        _reject_unsafe_tracking_code(experiment.money)
         _reject_known_tracking_code(store, experiment)
         try:
             store.insert_experiment(experiment)
         except sqlite3.IntegrityError as exc:
+            # With UUID ids the realistic clash is the unique tracking-code
+            # index, not the id; report the code the operator can act on.
+            if "experiments_tracking_code" in str(exc):
+                code = getattr(experiment.money, "tracking_code", "")
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"tracking code {code} is already used",
+                ) from exc
             raise HTTPException(
                 status_code=409,
                 detail=f"experiment {experiment.id} already exists",
@@ -432,6 +458,12 @@ def create_app(
         try:
             rendered = renderer.render(rendering, path.parent)
             store.save_experiment(rendered)
+        except Exception as exc:
+            # A crash between the claim and the save would strand the row in
+            # `rendering` forever: no route can re-enter that state except
+            # this one, so the failure is recorded before it propagates.
+            store.save_experiment(mark_render_failed(rendering, str(exc)))
+            raise
         finally:
             # Keep the in-flight claim until the result is saved: releasing it
             # earlier would let a same-experiment request re-read the stale
@@ -443,6 +475,11 @@ def create_app(
     @app.post("/experiments/{experiment_id}/approve")
     def approve_experiment(experiment_id: str, body: ApproveIn):
         experiment = _require_experiment(store, experiment_id)
+        # An unparseable `now` would make the measurement window silently
+        # never close (US-027): _reject_before_window_end and _clicks_window
+        # both no-op on a value _parse_iso cannot read.
+        if _parse_iso(body.now) is None:
+            raise HTTPException(status_code=422, detail="now must be an ISO timestamp")
         approved = approve(experiment, now=body.now)
         store.save_experiment(approved)
         return _experiment_json(store, approved)
@@ -455,8 +492,10 @@ def create_app(
         return _experiment_json(store, rejected)
 
     @app.post("/experiments/{experiment_id}/complete")
-    def complete_experiment(experiment_id: str):
+    def complete_experiment(experiment_id: str, body: CompleteIn | None = None):
         experiment = _require_experiment(store, experiment_id)
+        if not (body and body.force):
+            _reject_before_window_end(experiment)
         closed = complete(experiment)
         store.save_experiment(closed)
         return _experiment_json(store, closed)
@@ -470,6 +509,7 @@ def create_app(
             platform = Platform(body.platform)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _require_text(body.account_id, "account_id")
         result = publisher.publish(experiment, platform, body.account_id, token=body.token)
         publication = result.publication
         if publication.post_url:
@@ -517,6 +557,7 @@ def create_app(
         for experiment in experiments:
             payload = _experiment_json(store, experiment)
             payload["views"] = _views_for(store, experiment.id)
+            payload["clicks_window"] = _clicks_window(store, experiment)
             payload["below_sample_floor"] = below_sample_floor(cell_size(experiments, experiment))
             rows.append(payload)
         return rows
@@ -530,6 +571,12 @@ def create_app(
             if not body.niche_ids or any(not str(niche).strip() for niche in body.niche_ids):
                 raise HTTPException(status_code=422, detail="niche_ids is required")
             money = _money_from(body.money)
+            # A blank code would mint "-avatar"/"-avatar-2" drafts that
+            # credit nobody; the operator has to name the code.
+            if isinstance(money, (Affiliate, OwnOffer)) and not money.tracking_code.strip():
+                raise HTTPException(status_code=422, detail="tracking_code is required")
+            _reject_unsafe_tracking_code(money)
+            _reject_unusable_own_offer_url(money)
             niches = [_require_niche(store, niche_id) for niche_id in body.niche_ids]
             drafts = starter_grid(
                 body.niche_ids,
@@ -548,9 +595,16 @@ def create_app(
             experiment = _experiment_from_draft(draft)
             niche = niche_by_id[draft.niche_id]
             _guard_length(experiment)
+            experiment = _mint_unique_tracking_code(store, experiment)
             try:
                 store.insert_experiment(experiment)
             except sqlite3.IntegrityError as exc:
+                if "experiments_tracking_code" in str(exc):
+                    code = getattr(experiment.money, "tracking_code", "")
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"tracking code {code} is already used",
+                    ) from exc
                 raise HTTPException(
                     status_code=409,
                     detail=f"experiment {experiment.id} already exists",
@@ -565,6 +619,17 @@ def create_app(
     def suggest_next():
         experiments = list(store.list_experiments())
         catalog = store.catalog()
+        # The honest ranker's floor applies to every path (US-027): with no
+        # eligible parent there is nothing to propose from, and a silent []
+        # would read as "nothing to do" instead of "cells are too thin".
+        if not eligible_parents(experiments):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"no finished cell has {SAMPLE_FLOOR} completed videos; "
+                    "every cell is too thin to name a cause"
+                ),
+            )
         if proposer is None:
             drafts = suggest(experiments, catalog)
         else:
@@ -582,8 +647,36 @@ def create_app(
     @app.post("/snapshots")
     def create_snapshot(body: SnapshotIn):
         _require_publication(store, body.publication_id)
+        # Snapshots order by captured_at (US-030): a value _parse_iso cannot
+        # read would corrupt the history's order, so it is refused up front.
+        if body.captured_at is not None and _parse_iso(body.captured_at) is None:
+            raise HTTPException(status_code=422, detail="captured_at must be an ISO timestamp")
         record_snapshot(store, body.publication_id, body.model_dump())
         return {"ok": True}
+
+    @app.post("/experiments/{experiment_id}/revenue")
+    def record_revenue(experiment_id: str, body: RevenueIn):
+        experiment = _require_experiment(store, experiment_id)
+        entry = store.record_revenue(
+            experiment.id,
+            body.amount_cents,
+            body.note.strip(),
+            _now(),
+        )
+        return {
+            "entry": entry,
+            "revenue_cents": store.get_experiment(experiment.id).revenue_cents,
+        }
+
+    @app.get("/experiments/{experiment_id}/revenue")
+    def list_revenue(experiment_id: str):
+        _require_experiment(store, experiment_id)
+        return store.list_revenue_entries(experiment_id)
+
+    @app.get("/publications/{publication_id}/snapshots")
+    def list_publication_snapshots(publication_id: str):
+        _require_publication(store, publication_id)
+        return list(reversed(store.list_snapshots(publication_id)))
 
     @app.get("/experiments/{experiment_id}/publications")
     def list_experiment_publications(experiment_id: str):
@@ -603,6 +696,10 @@ def create_app(
 
 def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _render_cap(store) -> int:
@@ -666,6 +763,34 @@ def _views_for(store, experiment_id: str) -> int:
     return total
 
 
+def _clicks_window(store, experiment: Experiment) -> int:
+    """Clicks recorded between approved_at and the end of the measurement
+    window (US-025). An experiment that was never approved has no window
+    yet, so nothing is windowed (0) until approve stamps approved_at."""
+    if not experiment.approved_at:
+        return 0
+    start = _parse_iso(experiment.approved_at)
+    if start is None:
+        return 0
+    end = start + timedelta(days=experiment.measurement_window_days)
+    windowed = 0
+    for created_at in store.list_click_times(experiment.id):
+        moment = _parse_iso(created_at)
+        if moment is not None and start <= moment <= end:
+            windowed += 1
+    return windowed
+
+
+def _parse_iso(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def _require_text(value: str, label: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise HTTPException(status_code=422, detail=f"{label} is required")
@@ -681,10 +806,32 @@ def _guard_length(experiment: Experiment) -> None:
         raise IneligibleLength("TikTok Creator Rewards videos must be longer than 60 seconds")
 
 
-def _reject_blank_own_offer_url(experiment: Experiment) -> None:
-    """An own offer without a url would redirect clicks to an empty location."""
-    if isinstance(experiment.money, OwnOffer) and not experiment.money.offer_url.strip():
+def _reject_unusable_own_offer_url(money) -> None:
+    """A click on /r/{code} opens this URL (US-011): it must exist and be a
+    web URL on every creation path, or the counted click 302s nowhere."""
+    if not isinstance(money, OwnOffer):
+        return
+    url = money.offer_url.strip()
+    if not url:
         raise HTTPException(status_code=422, detail="own_offer money needs an offer_url")
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=422, detail="own_offer offer_url must start with http:// or https://")
+
+
+_SAFE_CODE_RE = re.compile(r"[A-Za-z0-9._~-]+")
+
+
+def _reject_unsafe_tracking_code(money) -> None:
+    """The code becomes the /r/{code} path segment (US-024): a code with a
+    space or a slash can never be hit, so it never reaches the store."""
+    if not isinstance(money, (Affiliate, OwnOffer)):
+        return
+    code = money.tracking_code.strip()
+    if code and not _SAFE_CODE_RE.fullmatch(code):
+        raise HTTPException(
+            status_code=422,
+            detail="tracking_code must be letters, digits, dots, hyphens, or underscores",
+        )
 
 
 def _reject_known_tracking_code(store, experiment: Experiment) -> None:
@@ -701,6 +848,39 @@ def _reject_known_tracking_code(store, experiment: Experiment) -> None:
                 status_code=422,
                 detail=f"tracking code {money.tracking_code} is already used by {row.id}",
             )
+
+
+def _mint_unique_tracking_code(store, experiment: Experiment) -> Experiment:
+    """Every video gets its own code (US-024): starter drafts over several
+    niches would otherwise share one code and split one click counter.
+    The operator names the code on POST /experiments (refused on a clash);
+    the starter grid recodes its drafts instead."""
+    money = experiment.money
+    if not isinstance(money, (Affiliate, OwnOffer)) or not money.tracking_code:
+        return experiment
+    code = store.mint_tracking_code(money.tracking_code)
+    if code == money.tracking_code:
+        return experiment
+    return replace(experiment, money=replace(money, tracking_code=code))
+
+
+def _reject_before_window_end(experiment: Experiment) -> None:
+    """A day-7 verdict needs the full window (US-027): completing early can
+    crown a false winner, so the operator must wait or explicitly force it."""
+    if not experiment.approved_at:
+        return
+    start = _parse_iso(experiment.approved_at)
+    if start is None:
+        return
+    end = start + timedelta(days=experiment.measurement_window_days)
+    if datetime.now(timezone.utc) < end:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"measurement window ends {end.isoformat()}; "
+                'complete after it closes, or send {"force": true} to override'
+            ),
+        )
 
 
 def _remember_catalog(store, experiment: Experiment) -> None:

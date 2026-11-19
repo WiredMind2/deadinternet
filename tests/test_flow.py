@@ -1,10 +1,11 @@
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
 from deadinternet.api.app import create_app
-from deadinternet.domain.experiment import Affiliate
-from tests.helpers import open_store
+from deadinternet.domain.experiment import Affiliate, Status
+from tests.helpers import experiment, open_store
 
 
 def _seed(store) -> None:
@@ -49,12 +50,15 @@ def test_flow_from_starter_grid_to_a_draft_proposal(tmp_path):
     assert rendered.status_code == 200, rendered.text
     assert rendered.json()["status"] == "in_review"
 
+    # Approve eight days ago: the 7-day measurement window is always already
+    # closed, so the unforced complete below can never become a 409.
+    approved_at = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
     approved = client.post(
         f"/experiments/{experiment_id}/approve",
-        json={"now": "2026-10-31T12:00:00Z"},
+        json={"now": approved_at},
     )
     assert approved.status_code == 200, approved.text
-    assert approved.json()["approved_at"] == "2026-10-31T12:00:00Z"
+    assert approved.json()["approved_at"] == approved_at
 
     posted = client.post(
         f"/experiments/{experiment_id}/publications",
@@ -87,11 +91,38 @@ def test_flow_from_starter_grid_to_a_draft_proposal(tmp_path):
     assert closed.json()["clicks"] == 1
 
     before = {row["id"] for row in client.get("/experiments").json()}
+    # US-027: the one finished row sits in a cell below the sample floor, so
+    # the honest ranker refuses to crown it and says why instead of
+    # returning [] (which reads as "nothing to do").
+    thin = client.post("/suggest")
+    assert thin.status_code == 422, thin.text
+    assert "3 completed videos" in thin.json()["detail"]
+    # The refusal writes nothing.
+    assert {row["id"] for row in client.get("/experiments").json()} == before
+
+    # Give the cell its floor of finished rows; the ranker may speak again.
+    store.insert_experiment(
+        experiment(
+            id="exp-seed-1",
+            status=Status.complete,
+            money=Affiliate(tracking_code="seed-1", merchant="acme"),
+        )
+    )
+    store.insert_experiment(
+        experiment(
+            id="exp-seed-2",
+            status=Status.complete,
+            money=Affiliate(tracking_code="seed-2", merchant="acme"),
+        )
+    )
+    before = {row["id"] for row in client.get("/experiments").json()}
     suggestion = client.post("/suggest")
     assert suggestion.status_code == 200, suggestion.text
     drafts = suggestion.json()
     assert len(drafts) == 1
-    assert len(drafts[0]["factor_diffs"]) >= 2
+    assert drafts[0]["parent_ids"] == [experiment_id]
+    # US-027: one deliberate factor change per draft, never two.
+    assert len(drafts[0]["factor_diffs"]) == 1
     after = {row["id"] for row in client.get("/experiments").json()}
     assert after == before
     suggested_files = list(tmp_path.rglob("*.mp4"))

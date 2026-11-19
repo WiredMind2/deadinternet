@@ -22,6 +22,13 @@ class ProposalRejected(DomainError):
     pass
 
 
+# research/synthesis.md decision 4 keeps the factor list on the proposal and
+# forbids crowning a winner after moving several factors. The factors the
+# synthesis names: style (decision 5), hook (decision 8), money path
+# (decision 3), length (decision 2), plus the niche the cell is scored in.
+FACTORS = ("niche", "style", "money", "hook", "length")
+
+
 @dataclass(frozen=True)
 class FactorDiff:
     field: str
@@ -79,6 +86,32 @@ def _is_near_copy(draft: DraftSpec, parent: Experiment) -> bool:
     return same_script and style_key(draft.style) == style_key(parent.style)
 
 
+def _money_path_key(money: Money) -> tuple[str, ...]:
+    """The money factor is the path, not the click code: every video mints
+    its own tracking code (US-024) inside an otherwise unchanged money path."""
+    if isinstance(money, Affiliate):
+        return (money.kind, money.merchant)
+    if isinstance(money, OwnOffer):
+        return (money.kind, money.offer_url)
+    return (money.kind, money.platform.value)
+
+
+def changed_factors(draft: DraftSpec, parent: Experiment) -> list[str]:
+    """Name every factor the draft moves relative to one parent."""
+    changed = []
+    if draft.niche_id != parent.niche_id:
+        changed.append("niche")
+    if style_key(draft.style) != style_key(parent.style):
+        changed.append("style")
+    if _money_path_key(draft.money) != _money_path_key(parent.money):
+        changed.append("money")
+    if draft.hook_id != parent.hook_id:
+        changed.append("hook")
+    if draft.length_sec != parent.length_sec:
+        changed.append("length")
+    return changed
+
+
 def parse_proposal(raw_drafts: list[dict], catalog: Catalog) -> list[DraftSpec]:
     parsed: list[DraftSpec] = []
     for raw in raw_drafts:
@@ -100,8 +133,16 @@ def parse_proposal(raw_drafts: list[dict], catalog: Catalog) -> list[DraftSpec]:
         )
         _check_ids(draft, catalog)
         for parent_id in draft.parent_ids:
-            if _is_near_copy(draft, catalog.parents[parent_id]):
+            parent = catalog.parents[parent_id]
+            if _is_near_copy(draft, parent):
                 raise ProposalRejected("near-copy of an existing script and look")
+            changed = changed_factors(draft, parent)
+            if len(changed) > 1:
+                raise ProposalRejected(
+                    "draft changes "
+                    + " and ".join(changed)
+                    + f" relative to {parent_id}; one deliberate factor per draft"
+                )
         parsed.append(draft)
     return parsed
 
@@ -157,6 +198,29 @@ def _with_tracking_suffix(money: Money, suffix: str) -> Money:
     if isinstance(money, OwnOffer):
         return OwnOffer(tracking_code=f"{money.tracking_code}-{suffix}", offer_url=money.offer_url)
     return money
+
+
+def mint_tracking_code(desired: str, taken: set[str]) -> str:
+    """Return `desired`, or a `-2`/`-3` variant no taken code collides with."""
+    code = desired
+    n = 2
+    while code in taken:
+        code = f"{desired}-{n}"
+        n += 1
+    return code
+
+
+def child_tracking_code(parent_code: str, taken: set[str]) -> str:
+    """A child video never reuses its parent's click code (US-024).
+
+    Derives `<parent>-c2`, `-c3`, ... until the code is free.
+    """
+    n = 2
+    code = f"{parent_code}-c{n}"
+    while code in taken:
+        n += 1
+        code = f"{parent_code}-c{n}"
+    return code
 
 
 def _starter_length(money: Money) -> int:

@@ -164,6 +164,21 @@ def test_a_save_between_click_and_revenue_never_erases_them(tmp_path):
     assert stored.revenue_cents == 250
 
 
+def test_record_revenue_on_an_unknown_experiment_changes_nothing(tmp_path):
+    """US-026: the total and the ledger are one transaction, so a refused
+    recording leaves both exactly as they were."""
+    store = Store(str(tmp_path / "lab.sqlite"))
+    face = _faceless()
+    store.insert_experiment(face)
+
+    with pytest.raises(KeyError):
+        store.record_revenue("exp-missing", 250, "payout", "2026-11-01T00:00:00Z")
+    stored = store.get_experiment(face.id)
+    assert stored.revenue_cents == face.revenue_cents
+    assert store.list_revenue_entries(face.id) == []
+    assert store.list_revenue_entries("exp-missing") == []
+
+
 def test_second_add_of_the_same_post_url_keeps_one_publication(tmp_path):
     store = Store(str(tmp_path / "lab.sqlite"))
     face = _faceless()
@@ -310,10 +325,11 @@ def test_catalog_lists_ids_and_every_experiment(tmp_path):
     assert store.get_offer("offer-1")["url"] == "https://shop.example/new"
     assert store.get_offer("missing") is None
 
+    # The cap wiring reads `render_cap` (app.py _render_cap); a missing key
+    # of any name falls back to the default.
     assert store.get_setting("daily_render_cap", 8) == 8
-    store.set_setting("daily_render_cap", 8)
-    store.set_setting("daily_render_cap", 6)
-    assert store.get_setting("daily_render_cap", 8) == 6
+    store.set_setting("render_cap", 6)
+    assert store.get_setting("render_cap", 8) == 6
 
 
 def test_snapshots_keep_insert_order(tmp_path):
@@ -427,3 +443,124 @@ def test_legacy_niche_rows_become_a_theme_and_a_series(tmp_path):
     assert loaded.niche_id == "history"
     assert loaded.script == "Old script"
     assert loaded.board_hash is None
+
+
+_LEGACY_EXPERIMENTS_SCHEMA = """
+        CREATE TABLE experiments (
+            id TEXT PRIMARY KEY,
+            niche_id TEXT NOT NULL,
+            hypothesis TEXT NOT NULL,
+            hook_id TEXT NOT NULL,
+            script TEXT NOT NULL,
+            caption TEXT NOT NULL,
+            style_json TEXT NOT NULL,
+            money_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            length_sec INTEGER NOT NULL,
+            proposal_id TEXT,
+            approved_at TEXT,
+            measurement_window_days INTEGER NOT NULL,
+            file_path TEXT,
+            render_error TEXT,
+            language TEXT NOT NULL,
+            clicks INTEGER NOT NULL DEFAULT 0,
+            revenue_cents INTEGER NOT NULL DEFAULT 0
+        )
+"""
+
+
+def _legacy_row(row_id: str, tracking_code: str) -> tuple:
+    return (
+        row_id,
+        "history",
+        "Keep the old cell",
+        "question",
+        f"Old script {row_id}",
+        "Old caption",
+        json.dumps(
+            {
+                "kind": "faceless",
+                "look": "stills",
+                "voice_id": "voice-1",
+                "caption_style": "bold",
+            }
+        ),
+        json.dumps({"kind": "affiliate", "tracking_code": tracking_code, "merchant": "acme"}),
+        "draft",
+        45,
+        7,
+        "en",
+    )
+
+
+def test_legacy_duplicate_tracking_codes_are_renamed_not_deleted(tmp_path):
+    """US-024: a legacy database with duplicate codes upgrades without
+    crashing and without deleting rows; new duplicates are then refused."""
+    path = tmp_path / "legacy-duplicates.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE niches (id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO niches (id, name, language) VALUES ('history', 'History', 'en')")
+    conn.execute(_LEGACY_EXPERIMENTS_SCHEMA)
+    conn.executemany(
+        """
+        INSERT INTO experiments (
+            id, niche_id, hypothesis, hook_id, script, caption, style_json, money_json,
+            status, length_sec, measurement_window_days, language
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [_legacy_row("exp-first", "abc"), _legacy_row("exp-second", "abc")],
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(str(path))
+    first = store.get_experiment("exp-first")
+    second = store.get_experiment("exp-second")
+    # The earliest row keeps the shared code; the later duplicate is recoded.
+    assert first.money.tracking_code == "abc"
+    assert second.money.tracking_code == "abc-2"
+
+    # After the upgrade the unique index refuses any new duplicate outright.
+    with pytest.raises(sqlite3.IntegrityError):
+        store.insert_experiment(replace(first, id="exp-new"))
+
+    # Re-opening the migrated file is a no-op: the codes stay put.
+    reopened = Store(str(path))
+    assert reopened.get_experiment("exp-first").money.tracking_code == "abc"
+    assert reopened.get_experiment("exp-second").money.tracking_code == "abc-2"
+
+
+def test_legacy_click_counters_are_backfilled_into_the_log(tmp_path):
+    """US-025: the counter and the log must agree, including for clicks
+    recorded before the log existed. The backfill is idempotent."""
+    path = tmp_path / "legacy-clicks.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE niches (id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO niches (id, name, language) VALUES ('history', 'History', 'en')")
+    conn.execute(_LEGACY_EXPERIMENTS_SCHEMA)
+    conn.execute(
+        """
+        INSERT INTO experiments (
+            id, niche_id, hypothesis, hook_id, script, caption, style_json, money_json,
+            status, length_sec, measurement_window_days, language, clicks
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        _legacy_row("exp-clicks", "abc")[:12] + (5,),
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(str(path))
+    times = store.list_click_times("exp-clicks")
+    assert len(times) == 5
+    assert all(times[0] == stamp for stamp in times)
+    assert store.get_experiment("exp-clicks").clicks == 5
+
+    # Re-opening neither adds rows nor moves the counter.
+    reopened = Store(str(path))
+    assert len(reopened.list_click_times("exp-clicks")) == 5
+    assert reopened.get_experiment("exp-clicks").clicks == 5

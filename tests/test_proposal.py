@@ -1,14 +1,18 @@
+from dataclasses import replace
+
 import pytest
 
 from deadinternet.domain.experiment import (
     Affiliate,
+    AvatarStyle,
     Experiment,
     FacelessStyle,
     Look,
+    OwnOffer,
     Status,
 )
 from deadinternet.domain.proposal import Catalog, ProposalRejected, parse_proposal, starter_grid
-from deadinternet.domain.rank import below_sample_floor, cell_size, suggest
+from deadinternet.domain.rank import SAMPLE_FLOOR, below_sample_floor, cell_size, suggest
 
 
 def _catalog(**overrides) -> Catalog:
@@ -40,10 +44,45 @@ def _parent() -> Experiment:
     )
 
 
-def _raw_from_parent(script: str, style: dict) -> dict:
+def _sibling(sid: str, revenue: int = 0) -> Experiment:
+    """A finished row in the parent's cell: same niche, style, money kind."""
+    return Experiment(
+        id=sid,
+        niche_id="niche-1",
+        hypothesis="Question hook",
+        hook_id="question",
+        script=f"{sid} spoken script.",
+        caption="Caption",
+        style=FacelessStyle(look=Look.stills, voice_id="voice-1", caption_style="bold"),
+        money=Affiliate(tracking_code=f"abc-{sid}", merchant="acme"),
+        status=Status.complete,
+        length_sec=50,
+        revenue_cents=revenue,
+    )
+
+
+def _avatar_sibling(sid: str, revenue: int = 0) -> Experiment:
+    return Experiment(
+        id=sid,
+        niche_id="niche-1",
+        hypothesis="Avatar cut",
+        hook_id="question",
+        script=f"{sid} spoken script.",
+        caption="Caption",
+        style=AvatarStyle(presenter_id="presenter-1", voice_id="voice-1"),
+        money=Affiliate(tracking_code=f"av-{sid}", merchant="acme"),
+        status=Status.complete,
+        length_sec=50,
+        revenue_cents=revenue,
+    )
+
+
+def _raw_from_parent(script: str, style: dict, diffs: list | None = None) -> dict:
     return {
         "parent_ids": ["exp-parent"],
-        "factor_diffs": [
+        "factor_diffs": diffs
+        if diffs is not None
+        else [
             {"field": "style", "parent_value": "faceless", "next_value": "avatar"},
             {"field": "hook_id", "parent_value": "question", "next_value": "result"},
         ],
@@ -85,14 +124,101 @@ def test_near_copy_is_refused():
         parse_proposal([raw], catalog)
 
 
-def test_suggest_changes_more_than_one_factor_and_does_not_render():
+def test_suggest_changes_exactly_one_factor_and_derives_a_fresh_code():
+    parent = _parent()
+    rows = [parent, _sibling("sib-1", 100), _sibling("sib-2", 50)]
+    catalog = _catalog(parents={row.id: row for row in rows})
+    drafts = suggest(rows, catalog)
+    assert len(drafts) == 1
+    assert [diff.field for diff in drafts[0].factor_diffs] == ["style"]
+    assert drafts[0].hook_id == parent.hook_id
+    assert drafts[0].length_sec == parent.length_sec
+    assert drafts[0].niche_id == parent.niche_id
+    # One video, one code: the child derives `abc-c2`, never the parent's abc.
+    assert drafts[0].money.tracking_code == "abc-c2"
+    assert drafts[0].money.tracking_code != parent.money.tracking_code
+    assert drafts[0].script != parent.script
+    # The floor boundary is pinned, not just one side of it.
+    assert below_sample_floor(SAMPLE_FLOOR - 1)
+    assert not below_sample_floor(SAMPLE_FLOOR)
+
+
+def test_suggest_returns_empty_when_a_two_row_cell_is_still_thin():
+    parent = _parent()
+    rows = [parent, _sibling("sib-1", 100)]
+    assert suggest(rows, _catalog(parents={row.id: row for row in rows})) == []
+
+
+def test_suggest_derives_the_next_child_code_when_c2_is_taken():
+    parent = _parent()
+    rows = [parent, _sibling("c2", 100), _sibling("sib-2", 50)]
+    # The "c2" sibling already holds the code the first child would derive,
+    # so the child code rolls forward instead of colliding.
+    drafts = suggest(rows, _catalog(parents={row.id: row for row in rows}))
+    assert drafts[0].money.tracking_code == "abc-c3"
+
+
+def test_suggest_from_an_own_offer_parent_keeps_the_offer_and_mints_a_code():
+    offer_url = "https://shop.example/offer"
+    parent = replace(_parent(), money=OwnOffer(tracking_code="own-1", offer_url=offer_url))
+    rows = [
+        parent,
+        replace(_sibling("sib-1", 100), money=OwnOffer(tracking_code="own-sib-1", offer_url=offer_url)),
+        replace(_sibling("sib-2", 50), money=OwnOffer(tracking_code="own-sib-2", offer_url=offer_url)),
+    ]
+    catalog = _catalog(
+        offer_ids=frozenset({"acme", offer_url}),
+        parents={row.id: row for row in rows},
+    )
+    drafts = suggest(rows, catalog)
+    assert isinstance(drafts[0].money, OwnOffer)
+    assert drafts[0].money.offer_url == offer_url
+    assert drafts[0].money.tracking_code == "own-1-c2"
+
+
+def test_suggest_skips_a_thin_cell_parent_for_the_next_eligible_row():
+    rich = _parent()  # top revenue, but its cell holds only itself
+    supported = _avatar_sibling("exp-avatar-top", 100)
+    rows = [rich, supported, _avatar_sibling("av-sib-1", 50), _avatar_sibling("av-sib-2", 10)]
+    catalog = _catalog(parents={row.id: row for row in rows})
+    drafts = suggest(rows, catalog)
+    assert len(drafts) == 1
+    assert drafts[0].parent_ids == (supported.id,)
+
+
+def test_suggest_returns_empty_when_every_finished_cell_is_thin():
+    parent = _parent()
+    assert suggest([parent], _catalog(parents={parent.id: parent})) == []
+
+
+def test_a_draft_moving_two_factors_is_refused():
     parent = _parent()
     catalog = _catalog(parents={parent.id: parent})
-    drafts = suggest([parent], catalog)
-    assert len(drafts) == 1
-    assert len(drafts[0].factor_diffs) >= 2
-    assert drafts[0].script != parent.script
-    assert below_sample_floor(1)
+    raw = _raw_from_parent(
+        "A different script.",
+        {"kind": "avatar", "presenter_id": "presenter-1", "voice_id": "voice-1"},
+    )
+    with pytest.raises(ProposalRejected, match="one deliberate factor"):
+        parse_proposal([raw], catalog)
+
+
+def test_a_draft_moving_exactly_one_factor_parses():
+    parent = _parent()
+    catalog = _catalog(parents={parent.id: parent})
+    raw = _raw_from_parent(
+        "A different script.",
+        {
+            "kind": "faceless",
+            "look": "stills",
+            "voice_id": "voice-1",
+            "caption_style": "bold",
+        },
+        # The draft moves exactly the hook; the declared list matches.
+        diffs=[{"field": "hook_id", "parent_value": "question", "next_value": "result"}],
+    )
+    drafts = parse_proposal([raw], catalog)
+    assert drafts[0].hook_id == "result"
+    assert drafts[0].style == parent.style
 
 
 def test_two_niches_score_as_different_cells():
@@ -116,9 +242,10 @@ def test_two_niches_score_as_different_cells():
 
 def test_suggest_without_a_presenter_is_a_clear_refusal():
     parent = _parent()
-    catalog = _catalog(presenter_ids=frozenset(), parents={parent.id: parent})
+    rows = [parent, _sibling("sib-1"), _sibling("sib-2")]
+    catalog = _catalog(presenter_ids=frozenset(), parents={row.id: row for row in rows})
     with pytest.raises(ProposalRejected, match="presenter"):
-        suggest([parent], catalog)
+        suggest(rows, catalog)
 
 
 def test_tiktok_starter_grid_is_longer_than_a_minute():
@@ -141,4 +268,7 @@ def test_starter_grid_creates_two_drafts_per_niche_without_rendering():
     assert all(len(draft.beats) == 1 for draft in drafts)
     assert drafts[0].script == drafts[0].beats[0].spoken
     codes = {draft.money.tracking_code for draft in drafts}
+    # The domain grid deliberately shares the base code across niches; the
+    # API layer recodes every draft before insert (see
+    # test_starter_gives_every_draft_a_distinct_code_across_niches).
     assert codes == {"abc", "abc-avatar"}

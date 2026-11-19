@@ -60,7 +60,7 @@ button:disabled {
 }
 
 .actions button,
-.search button,
+search button,
 form .actions button[type="submit"],
 .platform-fields > button {
   background: var(--amber);
@@ -69,7 +69,7 @@ form .actions button[type="submit"],
   font-weight: 700;
 }
 
-.actions button.danger {
+button.danger {
   background: transparent;
   color: var(--danger);
   border-color: #8a3a30;

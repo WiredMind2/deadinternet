@@ -33,8 +33,14 @@ function moneyKind(row) {
 function viewsOf(row) {
   if (!row || typeof row !== "object") return undefined;
   if (row.views !== undefined && row.views !== null) return row.views;
-  if (row.view_count !== undefined && row.view_count !== null) return row.view_count;
   return undefined;
+}
+
+function percentViewed(watchTimeSeconds, lengthSec) {
+  const watched = Number(watchTimeSeconds);
+  const length = Number(lengthSec);
+  if (!Number.isFinite(watched) || !Number.isFinite(length) || length <= 0) return "—";
+  return `${Math.round((watched / length) * 100)}%`;
 }
 
 function blank(value) {
@@ -161,6 +167,7 @@ function normalizeCatalog(data) {
     voices: idList(source.voice_ids || source.voices),
     presenters: idList(source.presenter_ids || source.presenters),
     hooks: idList(source.hook_ids || source.hooks),
+    offers: idList(source.offer_ids || source.offers),
   };
 }
 
@@ -220,7 +227,17 @@ function publicationFrom(data) {
 }
 
 function emptyPlatformRow() {
-  return { account_id: "", token: "", url: "", views: "", publication: null };
+  return {
+    account_id: "",
+    token: "",
+    url: "",
+    views: "",
+    watch_time_seconds: "",
+    likes: "",
+    comments: "",
+    shares: "",
+    publication: null,
+  };
 }
 
 function Facts({ rows }) {
@@ -239,13 +256,22 @@ function Facts({ rows }) {
 function TrackingLink({ code }) {
   const [copied, setCopied] = useState(false);
   const [failed, setFailed] = useState(false);
-  const url = `${window.location.origin}/r/${code}`;
+  const resetRef = useRef(null);
+  const url = `${window.location.origin}/r/${encodeURIComponent(code)}`;
+
+  useEffect(() => {
+    return () => {
+      if (resetRef.current) clearTimeout(resetRef.current);
+    };
+  }, []);
 
   async function copy() {
     setFailed(false);
+    if (resetRef.current) clearTimeout(resetRef.current);
     try {
       await navigator.clipboard.writeText(url);
       setCopied(true);
+      resetRef.current = setTimeout(() => setCopied(false), 2000);
     } catch {
       setCopied(false);
       setFailed(true);
@@ -522,6 +548,131 @@ function StoryboardEditor({ experiment, onChanged }) {
   );
 }
 
+function RevenuePanel({ experiment, onChanged }) {
+  const [amount, setAmount] = useState("");
+  const [note, setNote] = useState("");
+  const [ledger, setLedger] = useState(null);
+  const [ledgerFailed, setLedgerFailed] = useState(false);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLedger(null);
+    setLedgerFailed(false);
+    setError("");
+    api(`/experiments/${encodeURIComponent(experiment.id)}/revenue`)
+      .then((data) => {
+        if (!cancelled) setLedger(unwrapList(data));
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(errorMessage(err));
+          setLedgerFailed(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [experiment.id]);
+
+  async function loadLedger() {
+    try {
+      const data = await api(`/experiments/${encodeURIComponent(experiment.id)}/revenue`);
+      setLedger(unwrapList(data));
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  async function recordPayout(event) {
+    event.preventDefault();
+    const raw = String(amount ?? "").trim();
+    const cents = Number(raw);
+    if (!raw || !Number.isInteger(cents) || cents < 1) {
+      setError("Enter the payout amount in whole cents (1 or more).");
+      return;
+    }
+    setBusy("payout");
+    setError("");
+    try {
+      await api(`/experiments/${encodeURIComponent(experiment.id)}/revenue`, {
+        method: "POST",
+        body: JSON.stringify({ amount_cents: cents, note: note.trim() }),
+      });
+      setAmount("");
+      await loadLedger();
+      await onChanged(`Recorded ${cents} cents of revenue for ${experiment.id}.`);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <form onSubmit={recordPayout}>
+      <fieldset>
+        <legend>Revenue</legend>
+        <Banner>{error}</Banner>
+        <div className="filters">
+          <div className="filter">
+            <label htmlFor={`revenue-${experiment.id}-amount`}>amount_cents</label>
+            <input
+              id={`revenue-${experiment.id}-amount`}
+              type="number"
+              min="1"
+              value={amount}
+              onChange={(event) => setAmount(event.target.value)}
+            />
+          </div>
+          <div className="filter">
+            <label htmlFor={`revenue-${experiment.id}-note`}>note</label>
+            <input
+              id={`revenue-${experiment.id}-note`}
+              type="text"
+              value={note}
+              placeholder="tiktok payout"
+              onChange={(event) => setNote(event.target.value)}
+              spellCheck={false}
+            />
+          </div>
+          <button type="submit" disabled={Boolean(busy)}>
+            Record payout
+          </button>
+        </div>
+        {ledger === null && !ledgerFailed ? <p className="meta">Loading the ledger…</p> : null}
+        {ledger !== null && ledger.length === 0 ? (
+          <p className="meta">No payouts recorded yet.</p>
+        ) : null}
+        {ledger !== null && ledger.length > 0 ? (
+          <div className="table-wrap">
+            <table>
+              <caption>Payout ledger</caption>
+              <thead>
+                <tr>
+                  <th scope="col">amount_cents</th>
+                  <th scope="col">note</th>
+                  <th scope="col">created_at</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ledger.map((entry, index) => (
+                  <tr key={entry.id ?? `entry-${index}`}>
+                    <td>{show(entry.amount_cents)}</td>
+                    <td>{show(entry.note)}</td>
+                    <td>{show(entry.created_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+      </fieldset>
+    </form>
+  );
+}
+
 function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error }) {
   const [niche, setNiche] = useState("");
   const [style, setStyle] = useState("");
@@ -529,16 +680,26 @@ function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error 
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState("");
   const [actionError, setActionError] = useState("");
+  const [windowBlocked, setWindowBlocked] = useState(false);
 
-  async function completeVideo() {
+  useEffect(() => {
+    setWindowBlocked(false);
+  }, [selectedId]);
+
+  async function completeVideo(force = false) {
     if (!selected || selected.status !== "live") return;
     setBusy("complete");
     setActionError("");
+    setWindowBlocked(false);
     try {
-      await api(`/experiments/${encodeURIComponent(selected.id)}/complete`, { method: "POST" });
+      await api(`/experiments/${encodeURIComponent(selected.id)}/complete`, {
+        method: "POST",
+        ...(force ? { body: JSON.stringify({ force: true }) } : {}),
+      });
       await onChanged(`Completed ${selected.id}.`);
     } catch (err) {
       setActionError(errorMessage(err));
+      setWindowBlocked(err.status === 409);
     } finally {
       setBusy("");
     }
@@ -598,7 +759,7 @@ function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error 
         {filtered.length} shown
         {filtered.length !== experiments.length ? ` of ${experiments.length}` : ""}
       </p>
-      <div className="workspace">
+      <div className="workspace board">
         <div className="table-wrap">
           <table>
             <caption>Experiments</caption>
@@ -665,12 +826,22 @@ function Board({ experiments, selectedId, onSelect, onRefresh, onChanged, error 
           )}
           {selected && selected.status === "live" ? (
             <div className="actions">
-              <button type="button" onClick={completeVideo} disabled={Boolean(busy)}>
+              <button type="button" onClick={() => completeVideo()} disabled={Boolean(busy)}>
                 Complete
               </button>
+              {windowBlocked ? (
+                <button type="button" onClick={() => completeVideo(true)} disabled={Boolean(busy)}>
+                  Complete anyway (override window)
+                </button>
+              ) : null}
             </div>
           ) : null}
-          {selected ? <StoryboardEditor experiment={selected} onChanged={onChanged} /> : null}
+          {selected ? (
+            <RevenuePanel key={selected.id} experiment={selected} onChanged={onChanged} />
+          ) : null}
+          {selected && EDITABLE_BOARD.has(selected.status) ? (
+            <StoryboardEditor experiment={selected} onChanged={onChanged} />
+          ) : null}
         </section>
       </div>
     </>
@@ -730,7 +901,7 @@ function Review({ experiments, selectedId, onSelect, onChanged, loadError }) {
       {queue.length === 0 && !loadError ? (
         <p>Nothing is in review. Render a draft from the Board.</p>
       ) : null}
-      <div className="workspace">
+      <div className="workspace focus">
         <ul className="picker">
           {queue.map((row) => (
             <li key={row.id}>
@@ -794,15 +965,74 @@ function Review({ experiments, selectedId, onSelect, onChanged, loadError }) {
   );
 }
 
+function SnapshotHistory({ publicationId, lengthSec, version }) {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setRows(null);
+    setError("");
+    api(`/publications/${encodeURIComponent(publicationId)}/snapshots`)
+      .then((data) => {
+        if (!cancelled) setRows(unwrapList(data));
+      })
+      .catch((err) => {
+        if (!cancelled) setError(errorMessage(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [publicationId, version]);
+
+  if (error) return <Banner>{error}</Banner>;
+  if (rows === null) return <p className="meta">Loading snapshots…</p>;
+  if (rows.length === 0) return <p className="meta">No snapshots recorded yet.</p>;
+  return (
+    <div className="table-wrap">
+      <table>
+        <caption>Snapshots</caption>
+        <thead>
+          <tr>
+            <th scope="col">captured_at</th>
+            <th scope="col">views</th>
+            <th scope="col">avg watch s/view</th>
+            <th scope="col">percent viewed</th>
+            <th scope="col">likes</th>
+            <th scope="col">comments</th>
+            <th scope="col">shares</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, index) => (
+            <tr key={`${row.captured_at || "snapshot"}-${index}`}>
+              <td>{show(row.captured_at)}</td>
+              <td>{show(row.views)}</td>
+              <td>{show(row.watch_time_seconds)}</td>
+              <td>{percentViewed(row.watch_time_seconds, lengthSec)}</td>
+              <td>{show(row.likes)}</td>
+              <td>{show(row.comments)}</td>
+              <td>{show(row.shares)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
   const ready = experiments.filter((row) => row.status === "approved" || row.status === "live");
   const selected = ready.find((row) => row.id === selectedId) || ready[0] || null;
   const [forms, setForms] = useState({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [snapshotVersion, setSnapshotVersion] = useState(0);
+  const [windowBlocked, setWindowBlocked] = useState(false);
 
   useEffect(() => {
     setError("");
+    setWindowBlocked(false);
   }, [selected?.id]);
 
   useEffect(() => {
@@ -872,6 +1102,7 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
     }
     setBusy(platform);
     setError("");
+    setWindowBlocked(false);
     try {
       const data = await api(`/experiments/${encodeURIComponent(selected.id)}/publications`, {
         method: "POST",
@@ -898,7 +1129,7 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
   async function saveUrl(platform) {
     if (!selected) return;
     const row = formFor[platform];
-    const publicationId = row.publication?.id || row.publication?.publication_id;
+    const publicationId = row.publication?.id;
     if (!publicationId) {
       setError("This publication has no id yet.");
       return;
@@ -916,6 +1147,7 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
     }
     setBusy(`${platform}-url`);
     setError("");
+    setWindowBlocked(false);
     try {
       const data = await api(`/publications/${encodeURIComponent(publicationId)}/url`, {
         method: "POST",
@@ -934,7 +1166,7 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
   async function saveSnapshot(platform) {
     if (!selected) return;
     const row = formFor[platform];
-    const publicationId = row.publication?.id || row.publication?.publication_id;
+    const publicationId = row.publication?.id;
     if (!publicationId) {
       setError("Post this video before recording views.");
       return;
@@ -945,18 +1177,39 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
       return;
     }
     const views = Number(raw);
-    if (!Number.isFinite(views) || views < 0) {
-      setError("Views must be zero or more.");
+    if (!Number.isInteger(views) || views < 0) {
+      setError("Views must be a whole number, zero or more.");
       return;
+    }
+    const counts = {};
+    for (const [field, label] of [
+      ["watch_time_seconds", "Watch time"],
+      ["likes", "Likes"],
+      ["comments", "Comments"],
+      ["shares", "Shares"],
+    ]) {
+      const value = String(row[field] ?? "").trim();
+      if (!value) {
+        counts[field] = 0;
+        continue;
+      }
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        setError(`${label} must be a whole number, zero or more.`);
+        return;
+      }
+      counts[field] = parsed;
     }
     setBusy(`${platform}-views`);
     setError("");
+    setWindowBlocked(false);
     try {
       await api("/snapshots", {
         method: "POST",
-        body: JSON.stringify({ publication_id: publicationId, views }),
+        body: JSON.stringify({ publication_id: publicationId, views, ...counts }),
       });
-      await onChanged(`Recorded ${views} views for ${platform}.`);
+      setSnapshotVersion((current) => current + 1);
+      await onChanged(`Recorded a snapshot for ${platform}: ${views} views.`);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -964,15 +1217,20 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
     }
   }
 
-  async function completeSelected() {
+  async function completeSelected(force = false) {
     if (!selected) return;
     setBusy("complete");
     setError("");
+    setWindowBlocked(false);
     try {
-      await api(`/experiments/${encodeURIComponent(selected.id)}/complete`, { method: "POST" });
+      await api(`/experiments/${encodeURIComponent(selected.id)}/complete`, {
+        method: "POST",
+        ...(force ? { body: JSON.stringify({ force: true }) } : {}),
+      });
       await onChanged(`Completed ${selected.id}. Suggest can use it.`);
     } catch (err) {
       setError(errorMessage(err));
+      setWindowBlocked(err.status === 409);
     } finally {
       setBusy("");
     }
@@ -985,7 +1243,7 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
       {ready.length === 0 && !loadError ? (
         <p>No approved or live experiment. Approve a cut in Review first.</p>
       ) : null}
-      <div className="workspace">
+      <div className="workspace focus">
         <ul className="picker">
           {ready.map((row) => (
             <li key={row.id}>
@@ -1009,9 +1267,10 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
             <p className="meta">Leave the token blank. This lab returns a manual pack instead of posting.</p>
             <ol className="platforms">
               {PLATFORMS.map((platform) => {
-                const row = formFor[platform];
-                const publication = row.publication;
-                const manual = publication?.status === "manual_needed";
+                  const row = formFor[platform];
+                  const publication = row.publication;
+                  const publicationId = publication?.id;
+                  const manual = publication?.status === "manual_needed";
                 return (
                   <li key={platform} className="panel">
                     <h2>{platform}</h2>
@@ -1086,13 +1345,66 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
                             onChange={(event) => update(platform, { views: event.target.value })}
                           />
                         </div>
+                        <div className="filter">
+                          <label htmlFor={`${selected.id}-${platform}-watch`}>
+                            watch_time_seconds (avg per view)
+                          </label>
+                          <input
+                            id={`${selected.id}-${platform}-watch`}
+                            type="number"
+                            min="0"
+                            value={row.watch_time_seconds}
+                            onChange={(event) =>
+                              update(platform, { watch_time_seconds: event.target.value })
+                            }
+                          />
+                        </div>
+                        <div className="filter">
+                          <label htmlFor={`${selected.id}-${platform}-likes`}>likes</label>
+                          <input
+                            id={`${selected.id}-${platform}-likes`}
+                            type="number"
+                            min="0"
+                            value={row.likes}
+                            onChange={(event) => update(platform, { likes: event.target.value })}
+                          />
+                        </div>
+                        <div className="filter">
+                          <label htmlFor={`${selected.id}-${platform}-comments`}>comments</label>
+                          <input
+                            id={`${selected.id}-${platform}-comments`}
+                            type="number"
+                            min="0"
+                            value={row.comments}
+                            onChange={(event) => update(platform, { comments: event.target.value })}
+                          />
+                        </div>
+                        <div className="filter">
+                          <label htmlFor={`${selected.id}-${platform}-shares`}>shares</label>
+                          <input
+                            id={`${selected.id}-${platform}-shares`}
+                            type="number"
+                            min="0"
+                            value={row.shares}
+                            onChange={(event) => update(platform, { shares: event.target.value })}
+                          />
+                        </div>
                         <button
                           type="button"
                           onClick={() => saveSnapshot(platform)}
                           disabled={busy === `${platform}-views`}
                         >
-                          Record views
+                          Record snapshot
                         </button>
+                      </div>
+                    ) : null}
+                    {publication?.status === "posted" && publicationId ? (
+                      <div className="manual">
+                        <SnapshotHistory
+                          publicationId={publicationId}
+                          lengthSec={selected.length_sec}
+                          version={snapshotVersion}
+                        />
                       </div>
                     ) : null}
                   </li>
@@ -1101,9 +1413,22 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
             </ol>
             {selected.status === "live" ? (
               <div className="actions">
-                <button type="button" onClick={completeSelected} disabled={busy === "complete"}>
+                <button
+                  type="button"
+                  onClick={() => completeSelected()}
+                  disabled={busy === "complete"}
+                >
                   Complete experiment
                 </button>
+                {windowBlocked ? (
+                  <button
+                    type="button"
+                    onClick={() => completeSelected(true)}
+                    disabled={busy === "complete"}
+                  >
+                    Complete anyway (override window)
+                  </button>
+                ) : null}
               </div>
             ) : null}
           </div>
@@ -1139,13 +1464,19 @@ function Results() {
     <>
       <Banner>{error}</Banner>
       {loaded && rows.length === 0 && !error ? <p>No results yet.</p> : null}
+      {rows.length > 0 ? (
+        <p className="meta">
+          Total revenue_cents across experiments{" "}
+          <span className="mono">
+            {rows.reduce((sum, row) => sum + (Number(row.revenue_cents) || 0), 0)}
+          </span>
+        </p>
+      ) : null}
       <div className="score">
         {rows.map((row, index) => {
           const views = viewsOf(row);
           const title = [row.niche_id, styleKind(row), moneyKind(row)].filter(Boolean).join(" · ");
-          const below =
-            row.status === "complete" &&
-            (row.below_sample_floor === true || row.below_sample_floor === "true");
+          const below = row.below_sample_floor === true || row.below_sample_floor === "true";
           return (
             <article key={row.id || `${title}-${index}`} className="panel">
               <h2>{title || row.id || "Cell"}</h2>
@@ -1158,6 +1489,10 @@ function Results() {
                   <dt>clicks</dt>
                   <dd>{show(row.clicks)}</dd>
                 </div>
+                <div>
+                  <dt>clicks in window</dt>
+                  <dd>{show(row.clicks_window)}</dd>
+                </div>
                 {views !== undefined ? (
                   <div>
                     <dt>views</dt>
@@ -1165,7 +1500,9 @@ function Results() {
                   </div>
                 ) : null}
               </dl>
-              {below ? <p className="floor">Fewer than 3 completed videos in this cell.</p> : null}
+              {below ? (
+                <p className="floor">Completed videos in this cell are below the sample floor.</p>
+              ) : null}
             </article>
           );
         })}
@@ -1302,7 +1639,7 @@ function Proposals({ drafts, setDrafts, onAccepted }) {
 }
 
 function Catalog({ onBuilt }) {
-  const [hints, setHints] = useState({ themes: [], niches: [], voices: [], presenters: [], hooks: [] });
+  const [hints, setHints] = useState({ themes: [], niches: [], voices: [], presenters: [], hooks: [], offers: [] });
   const [renderCap, setRenderCap] = useState(8);
   const [catalogMissing, setCatalogMissing] = useState(false);
   const [draftLength, setDraftLength] = useState(45);
@@ -1693,6 +2030,7 @@ function Catalog({ onBuilt }) {
                   type="text"
                   value={merchant}
                   onChange={(event) => setMerchant(event.target.value)}
+                  list="catalog-offers"
                   spellCheck={false}
                 />
               </div>
@@ -1720,8 +2058,14 @@ function Catalog({ onBuilt }) {
                 type="text"
                 value={merchant}
                 onChange={(event) => setMerchant(event.target.value)}
+                list="catalog-offers"
                 spellCheck={false}
               />
+              <datalist id="catalog-offers">
+                {hints.offers.map((id) => (
+                  <option key={id} value={id} />
+                ))}
+              </datalist>
             </div>
             <div className="filter">
               <label htmlFor="offer-link">offer URL</label>
