@@ -21,6 +21,30 @@ index and `archive/` before minting a new one.
 | US-012 | Include script and ids in the manual publish pack | 2 | Done |
 | US-013 | Tell the operator when copying the tracking link failed | 1 | Done |
 | US-014 | Record dashboard setup and the Python 3.14 warning; restore the archive dir | 1 | Done |
+| US-015 | Creating an experiment can never damage an existing one | 5 | Done |
+| US-016 | Validate tracked inputs at the API boundary | 5 | Done |
+| US-017 | Score hook drafts without dead or over-eager rules | 3 | Done |
+| US-018 | Renders finish or fail on their own | 5 | Done |
+| US-019 | Open the lab's data from any directory | 1 | Done |
+| US-020 | The daily render cap holds under concurrent requests | 5 | Done |
+| US-021 | Dashboard form input correctness | 5 | Done |
+| US-022 | Dashboard error and state hygiene | 3 | Done |
+| US-023 | Saving an experiment never erases clicks or revenue | 1 | Done |
+
+## Backlog (next waves, not yet started)
+
+Wave 2 — make the score exist and be honest (from the claude-opus reflexion of
+2026-11-19, pending story files): every video gets its own tracking code
+(unique index + suggest mints a child code); a click log with timestamps so
+Results can honor the measurement window; payout/revenue entry (route +
+ledger + dashboard form); honest ranker (sample floor respected by suggest,
+one factor change per draft, no closing before the window ends).
+
+Wave 3 — make something worth scoring: faceless render with per-beat speech
+and burned-in captions; a public read-only /r/ click app separate from the
+admin API. Explicitly deferred per the reflexion: auto-posting clients, the
+avatar provider, a smarter LLM proposer, bandit statistics, stock-footage
+clips, splitting App.jsx, an ORM, a scheduler.
 
 ## Collisions
 

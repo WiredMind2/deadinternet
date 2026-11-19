@@ -24,7 +24,44 @@ def test_round_trip_keeps_the_hash(tmp_path):
     assert again == digest
 
 
-@pytest.mark.parametrize("segment", ["", " ", ".", "..", "a/b", "a\\b"])
+@pytest.mark.parametrize(
+    "segment",
+    [
+        "",
+        " ",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "a:b",
+        "a*b",
+        "a?b",
+        'a"b',
+        "a<b",
+        "a>b",
+        "a|b",
+        "a\tb",
+        "CON",
+        "con",
+        "NUL",
+        "PRN",
+        "AUX",
+        "COM1",
+        "com9",
+        "LPT1",
+        "lpt9",
+        "CON.json",
+        "nul.mp4",
+        "exp.",
+        "tail ",
+        "dotted. ",
+    ],
+)
 def test_path_segments_reject_escapes(segment):
     with pytest.raises(UnsafeId):
         check_segment(segment)
+
+
+@pytest.mark.parametrize("segment", ["exp-1", "niche_2", "history", "CONVO", "com-10", "a.b"])
+def test_path_segments_accept_ordinary_ids(segment):
+    assert check_segment(segment) == segment

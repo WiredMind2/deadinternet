@@ -128,16 +128,40 @@ def test_round_trip_faceless_affiliate_and_avatar_own_offer(tmp_path):
         status=Status.render_failed,
         render_error="encoder",
         hypothesis="Updated hypothesis",
-        clicks=9,
-        revenue_cents=2000,
     )
     store.save_experiment(edited)
     assert store.get_experiment(face.id) == edited
+
+    # A save from a stale copy must never rewrite the click and revenue
+    # counters; those belong to add_click and add_revenue alone.
+    stale = replace(edited, clicks=9, revenue_cents=2000)
+    store.save_experiment(stale)
+    kept = store.get_experiment(face.id)
+    assert kept.clicks == face.clicks
+    assert kept.revenue_cents == face.revenue_cents
 
     reopened = Store(path)
     assert reopened.get_experiment(face.id) == edited
     assert reopened.get_experiment(avatar.id) == avatar
     assert reopened.get_experiment(payout.id) == payout
+
+
+def test_a_save_between_click_and_revenue_never_erases_them(tmp_path):
+    store = Store(str(tmp_path / "lab.sqlite"))
+    face = _faceless(clicks=3, revenue_cents=0)
+    store.insert_experiment(face)
+
+    stale = store.get_experiment(face.id)
+    assert store.add_click("aff-face") == 4
+    store.save_experiment(stale)
+    assert store.get_experiment(face.id).clicks == 4
+
+    stale = store.get_experiment(face.id)
+    store.add_revenue(face.id, 250)
+    store.save_experiment(stale)
+    stored = store.get_experiment(face.id)
+    assert stored.clicks == 4
+    assert stored.revenue_cents == 250
 
 
 def test_second_add_of_the_same_post_url_keeps_one_publication(tmp_path):

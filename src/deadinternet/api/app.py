@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from deadinternet.domain.experiment import (
     Affiliate,
@@ -190,11 +190,11 @@ class StarterIn(BaseModel):
 
 class SnapshotIn(BaseModel):
     publication_id: str
-    views: int = 0
-    watch_time_seconds: int = 0
-    likes: int = 0
-    comments: int = 0
-    shares: int = 0
+    views: int = Field(default=0, ge=0)
+    watch_time_seconds: int = Field(default=0, ge=0)
+    likes: int = Field(default=0, ge=0)
+    comments: int = Field(default=0, ge=0)
+    shares: int = Field(default=0, ge=0)
     captured_at: str | None = None
     failed: bool = False
 
@@ -245,6 +245,11 @@ def create_app(
     publisher = publisher or PlaceholderPublisher()
     app = FastAPI(title="Dead Internet")
     app.state.store = store
+    # The cap check and the per-experiment claim must be one atomic step:
+    # separate store locks let two requests both pass an 8-cap (or both
+    # run ffmpeg on the same output path).
+    render_gate = threading.Lock()
+    renders_in_flight: set[str] = set()
 
     @app.exception_handler(InvalidTransition)
     def invalid_transition(_request, exc: InvalidTransition):
@@ -358,9 +363,17 @@ def create_app(
         except (KeyError, ValueError, TypeError, UnsafeId) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         _guard_length(experiment)
+        _reject_blank_own_offer_url(experiment)
+        _reject_known_tracking_code(store, experiment)
+        try:
+            store.insert_experiment(experiment)
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"experiment {experiment.id} already exists",
+            ) from exc
         path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
         write_storyboard(path, beats)
-        store.insert_experiment(experiment)
         _remember_catalog(store, experiment)
         return _experiment_json(store, experiment)
 
@@ -398,22 +411,33 @@ def create_app(
 
     @app.post("/experiments/{experiment_id}/render")
     def render_experiment(experiment_id: str):
-        experiment = _require_experiment(store, experiment_id)
-        if experiment.status not in {Status.board_approved, Status.render_failed}:
-            request_render(experiment, 0)
-        niche = _require_niche(store, experiment.niche_id)
-        path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
-        beats, digest = _load_board(store, experiment_id)
-        if digest != experiment.board_hash:
-            store.save_experiment(revise_board(experiment, beats))
-            raise HTTPException(status_code=409, detail="storyboard changed since approval")
-        experiment = replace(experiment, script=script_from_beats(beats))
-        day = _today()
-        started = store.renders_started_today(day) or 0
-        rendering = request_render(experiment, int(started), cap=_render_cap(store))
-        store.record_render_start(experiment.id, day)
-        rendered = renderer.render(rendering, path.parent)
-        store.save_experiment(rendered)
+        with render_gate:
+            if experiment_id in renders_in_flight:
+                raise HTTPException(status_code=409, detail="a render is already in progress")
+            experiment = _require_experiment(store, experiment_id)
+            if experiment.status not in {Status.board_approved, Status.render_failed}:
+                request_render(experiment, 0)
+            niche = _require_niche(store, experiment.niche_id)
+            path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
+            beats, digest = _load_board(store, experiment_id)
+            if digest != experiment.board_hash:
+                store.save_experiment(revise_board(experiment, beats))
+                raise HTTPException(status_code=409, detail="storyboard changed since approval")
+            experiment = replace(experiment, script=script_from_beats(beats))
+            day = _today()
+            started = store.renders_started_today(day) or 0
+            rendering = request_render(experiment, int(started), cap=_render_cap(store))
+            store.record_render_start(experiment.id, day)
+            renders_in_flight.add(experiment_id)
+        try:
+            rendered = renderer.render(rendering, path.parent)
+            store.save_experiment(rendered)
+        finally:
+            # Keep the in-flight claim until the result is saved: releasing it
+            # earlier would let a same-experiment request re-read the stale
+            # status and start a second ffmpeg on the same output path.
+            with render_gate:
+                renders_in_flight.discard(experiment_id)
         return _experiment_json(store, rendered)
 
     @app.post("/experiments/{experiment_id}/approve")
@@ -469,13 +493,20 @@ def create_app(
         publication = _require_publication(store, publication_id)
         if publication.status != PublicationStatus.manual_needed:
             raise HTTPException(status_code=409, detail="publication is not waiting for a url")
-        if not body.url:
-            raise HTTPException(status_code=422, detail="url is required")
+        url = body.url.strip()
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=422, detail="url must start with http:// or https://")
         experiment = _require_experiment(store, publication.experiment_id)
         if experiment.status not in (Status.approved, Status.live):
             raise HTTPException(status_code=409, detail=f"{experiment.status.value} cannot post")
-        updated = replace(publication, status=PublicationStatus.posted, post_url=body.url, error=None)
-        store.save_publication(updated)
+        updated = replace(publication, status=PublicationStatus.posted, post_url=url, error=None)
+        try:
+            store.save_publication(updated)
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="that url is already stored for this experiment",
+            ) from exc
         store.save_experiment(mark_posted(experiment))
         return _publication_json(updated)
 
@@ -516,10 +547,16 @@ def create_app(
         for draft in drafts:
             experiment = _experiment_from_draft(draft)
             niche = niche_by_id[draft.niche_id]
+            _guard_length(experiment)
+            try:
+                store.insert_experiment(experiment)
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"experiment {experiment.id} already exists",
+                ) from exc
             path = storyboard_path(_media_dir(store), niche.theme_id, niche.id, experiment.id)
             write_storyboard(path, draft.beats)
-            _guard_length(experiment)
-            store.insert_experiment(experiment)
             _remember_catalog(store, experiment)
             created.append(_experiment_json(store, experiment))
         return created
@@ -544,6 +581,7 @@ def create_app(
 
     @app.post("/snapshots")
     def create_snapshot(body: SnapshotIn):
+        _require_publication(store, body.publication_id)
         record_snapshot(store, body.publication_id, body.model_dump())
         return {"ok": True}
 
@@ -580,7 +618,10 @@ def _render_cap(store) -> int:
         return 8
     if isinstance(raw, str):
         raw = raw.strip()
-    return int(raw)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 8
 
 
 def _media_dir(store) -> Path:
@@ -638,6 +679,28 @@ def _guard_length(experiment: Experiment) -> None:
         and experiment.length_sec <= 60
     ):
         raise IneligibleLength("TikTok Creator Rewards videos must be longer than 60 seconds")
+
+
+def _reject_blank_own_offer_url(experiment: Experiment) -> None:
+    """An own offer without a url would redirect clicks to an empty location."""
+    if isinstance(experiment.money, OwnOffer) and not experiment.money.offer_url.strip():
+        raise HTTPException(status_code=422, detail="own_offer money needs an offer_url")
+
+
+def _reject_known_tracking_code(store, experiment: Experiment) -> None:
+    """Two experiments sharing a code would split one click counter."""
+    money = experiment.money
+    if not isinstance(money, (Affiliate, OwnOffer)) or not money.tracking_code:
+        return
+    for row in store.list_experiments():
+        if row.id == experiment.id:
+            continue
+        other = row.money
+        if isinstance(other, (Affiliate, OwnOffer)) and other.tracking_code == money.tracking_code:
+            raise HTTPException(
+                status_code=422,
+                detail=f"tracking code {money.tracking_code} is already used by {row.id}",
+            )
 
 
 def _remember_catalog(store, experiment: Experiment) -> None:
