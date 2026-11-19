@@ -273,6 +273,11 @@ p {
   border-color: #35501c;
 }
 
+.banner-dismiss {
+  margin-left: 0.6rem;
+  padding: 0.25rem 0.6rem;
+}
+
 .filters,
 .form-grid,
 .platform-fields {

@@ -158,6 +158,7 @@ class Experiment:
     parent_ids: tuple[str, ...] = ()
     factor_diffs: tuple[FactorDiff, ...] = ()
     approved_at: str | None = None
+    first_posted_at: str | None = None
     measurement_window_days: int = 7
     file_path: str | None = None
     render_error: str | None = None

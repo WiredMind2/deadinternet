@@ -210,11 +210,13 @@ class StarterIn(BaseModel):
 
 class SnapshotIn(BaseModel):
     publication_id: str
-    views: int = Field(default=0, ge=0)
-    watch_time_seconds: int = Field(default=0, ge=0)
-    likes: int = Field(default=0, ge=0)
-    comments: int = Field(default=0, ge=0)
-    shares: int = Field(default=0, ge=0)
+    # A count of null is "not measured" and is stored absent (US-038);
+    # an explicit 0 is a measured zero.
+    views: int | None = Field(default=None, ge=0)
+    watch_time_seconds: int | None = Field(default=None, ge=0)
+    likes: int | None = Field(default=None, ge=0)
+    comments: int | None = Field(default=None, ge=0)
+    shares: int | None = Field(default=None, ge=0)
     captured_at: str | None = None
     failed: bool = False
 
@@ -330,6 +332,12 @@ def create_app(
             "offer_ids": sorted(catalog.offer_ids),
             "render_cap": _render_cap(store),
         }
+
+    @app.get("/tracking-code-renames")
+    def tracking_code_renames():
+        """US-039: the duplicate-code upgrade names what it renamed, so a
+        published link carrying an old code is never silently re-credited."""
+        return store.get_setting("tracking_code_renames") or []
 
     @app.post("/themes")
     def create_theme(body: ThemeIn):
@@ -535,13 +543,13 @@ def create_app(
         if publication.post_url:
             existing = store.publication_by_url(experiment.id, publication.post_url)
             if existing is not None:
-                store.save_experiment(mark_posted(experiment))
+                store.save_experiment(_stamp_first_post(mark_posted(experiment)))
                 return _publication_json(existing)
         stored = store.add_publication(publication)
         if isinstance(stored, Publication):
             publication = stored
         if publication.post_url:
-            store.save_experiment(mark_posted(experiment))
+            store.save_experiment(_stamp_first_post(mark_posted(experiment)))
         payload = _publication_json(publication)
         manual_pack = getattr(result, "manual_pack", None)
         if manual_pack:
@@ -567,7 +575,7 @@ def create_app(
                 status_code=409,
                 detail="that url is already stored for this experiment",
             ) from exc
-        store.save_experiment(mark_posted(experiment))
+        store.save_experiment(_stamp_first_post(mark_posted(experiment)))
         return _publication_json(updated)
 
     @app.get("/results")
@@ -808,22 +816,25 @@ def _publications(store) -> list[Publication]:
 
 
 def _views_for(store, experiment_id: str) -> int:
-    """Sum the latest snapshot views of every publication of one experiment."""
+    """Sum the latest snapshot views of every publication of one
+    experiment. A latest snapshot with absent views is "not measured"
+    (US-038) and contributes nothing."""
     total = 0
     for publication in store.list_publications(experiment_id):
         snapshots = store.list_snapshots(publication.id)
         if snapshots:
-            total += int(snapshots[-1]["views"])
+            views = snapshots[-1]["views"]
+            if views is not None:
+                total += int(views)
     return total
 
 
 def _clicks_window(store, experiment: Experiment) -> int:
-    """Clicks recorded between approved_at and the end of the measurement
-    window (US-025). An experiment that was never approved has no window
-    yet, so nothing is windowed (0) until approve stamps approved_at."""
-    if not experiment.approved_at:
-        return 0
-    start = _parse_iso(experiment.approved_at)
+    """Clicks recorded inside the measurement window (US-025). The window
+    opens at the later of the approval and the first post on the server
+    clock (US-035); an experiment with neither stamp has no window yet, so
+    nothing is windowed (0) until one lands."""
+    start = _window_anchor(experiment)
     if start is None:
         return 0
     end = start + timedelta(days=experiment.measurement_window_days)
@@ -926,13 +937,12 @@ def _mint_unique_tracking_code(store, experiment: Experiment) -> Experiment:
 
 def _reject_before_window_end(experiment: Experiment) -> None:
     """A day-7 verdict needs the full window (US-027): completing early can
-    crown a false winner, so the operator must wait or explicitly force it."""
-    if not experiment.approved_at:
+    crown a false winner, so the operator must wait or explicitly force it.
+    The window opens at `_window_anchor` (US-035): an experiment never
+    posted falls back to the approval stamp rather than closing at once."""
+    end = _window_end_moment(experiment)
+    if end is None:
         return
-    start = _parse_iso(experiment.approved_at)
-    if start is None:
-        return
-    end = start + timedelta(days=experiment.measurement_window_days)
     if datetime.now(timezone.utc) < end:
         raise HTTPException(
             status_code=409,
@@ -941,6 +951,47 @@ def _reject_before_window_end(experiment: Experiment) -> None:
                 'complete after it closes, or send {"force": true} to override'
             ),
         )
+
+
+def _window_anchor(experiment: Experiment) -> datetime | None:
+    """The single window anchor (US-035): the later of the approval stamp
+    and the first post stamp. The first post is always the server's own
+    clock; approved_at stays what the operator's browser sent (it is
+    displayed), so a client clock that lies can only push the anchor
+    later and lengthen the window, never shorten it. An experiment never
+    posted falls back to the approval timestamp alone."""
+    moments = []
+    for value in (experiment.approved_at, experiment.first_posted_at):
+        if value:
+            parsed = _parse_iso(value)
+            if parsed is not None:
+                moments.append(parsed)
+    return max(moments) if moments else None
+
+
+def _window_end_moment(experiment: Experiment) -> datetime | None:
+    anchor = _window_anchor(experiment)
+    if anchor is None:
+        return None
+    return anchor + timedelta(days=experiment.measurement_window_days)
+
+
+def _window_end(experiment: Experiment) -> str | None:
+    """The window end as the payload serves it (US-035): Board and Post
+    show it before the operator can hit the complete 409."""
+    end = _window_end_moment(experiment)
+    if end is None:
+        return None
+    return end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _stamp_first_post(experiment: Experiment) -> Experiment:
+    """US-035: the window anchor is stamped when the FIRST publication of
+    the experiment reaches posted, on the server clock. The stamp is
+    written once; a later platform's post never moves it."""
+    if experiment.first_posted_at is not None:
+        return experiment
+    return replace(experiment, first_posted_at=_now())
 
 
 def _remember_catalog(store, experiment: Experiment) -> None:
@@ -1163,6 +1214,8 @@ def _experiment_json(store, experiment: Experiment) -> dict:
             for diff in experiment.factor_diffs
         ],
         "approved_at": experiment.approved_at,
+        "first_posted_at": experiment.first_posted_at,
+        "window_end": _window_end(experiment),
         "measurement_window_days": experiment.measurement_window_days,
         "file_path": experiment.file_path,
         "render_error": experiment.render_error,
@@ -1176,6 +1229,8 @@ def _experiment_json(store, experiment: Experiment) -> dict:
 def _publication_json(publication: Publication) -> dict:
     platform = publication.platform.value if isinstance(publication.platform, Platform) else publication.platform
     status = publication.status.value if isinstance(publication.status, PublicationStatus) else publication.status
+    # payout_cents is deliberately not served (US-036): nothing ever wrote
+    # it and it duplicated the revenue ledger, which owns payouts.
     return {
         "id": publication.id,
         "experiment_id": publication.experiment_id,
@@ -1184,7 +1239,6 @@ def _publication_json(publication: Publication) -> dict:
         "status": status,
         "post_url": publication.post_url,
         "error": publication.error,
-        "payout_cents": publication.payout_cents,
     }
 
 

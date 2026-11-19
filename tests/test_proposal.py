@@ -9,6 +9,8 @@ from deadinternet.domain.experiment import (
     FacelessStyle,
     Look,
     OwnOffer,
+    Platform,
+    PlatformPayout,
     Status,
 )
 from deadinternet.domain.proposal import (
@@ -190,6 +192,34 @@ def test_suggest_skips_a_thin_cell_parent_for_the_next_eligible_row():
     drafts = suggest(rows, catalog)
     assert len(drafts) == 1
     assert drafts[0].parent_ids == (supported.id,)
+
+
+def test_suggest_ranks_within_one_money_kind_not_across():
+    """US-036 (decision 3): the parent pick ranks within the parent's money
+    kind. The payout cell below out-earns the affiliate cell twenty to one,
+    but the affiliate draft still names the affiliate cell's own winner, and
+    the payout winner is proposed apart — never ranked against it."""
+    affiliate_rows = [_parent(), _sibling("sib-1", 100), _sibling("sib-2", 50)]
+    payout_top = replace(
+        _parent(),
+        id="exp-payout-top",
+        money=PlatformPayout(platform=Platform.youtube),
+        revenue_cents=9999,
+        script="Payout script.",
+    )
+    payout_rows = [payout_top] + [
+        replace(_sibling(f"pay-sib-{n}"), money=PlatformPayout(platform=Platform.youtube))
+        for n in (1, 2)
+    ]
+    rows = affiliate_rows + payout_rows
+    catalog = _catalog(parents={row.id: row for row in rows})
+    drafts = suggest(rows, catalog)
+    # One draft per money kind, in first-eligible-row order.
+    assert [draft.money.kind for draft in drafts] == ["affiliate", "platform_payout"]
+    assert drafts[0].parent_ids == ("exp-parent",)
+    assert drafts[0].money.tracking_code == "abc-c2"
+    assert drafts[1].parent_ids == ("exp-payout-top",)
+    assert drafts[1].money == PlatformPayout(platform=Platform.youtube)
 
 
 def test_suggest_returns_empty_when_every_finished_cell_is_thin():

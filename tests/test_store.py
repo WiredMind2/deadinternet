@@ -380,6 +380,67 @@ def test_snapshots_keep_insert_order(tmp_path):
     assert store.list_snapshots("missing") == []
 
 
+def test_add_snapshot_keeps_absent_counts_absent(tmp_path):
+    """US-038: absence is stored as NULL and reads back as None; a real
+    zero keeps its meaning as a measured zero."""
+    store = _store(tmp_path / "lab.sqlite")
+    store.add_snapshot("pub-1", "2026-11-01T00:00:00Z", None, None, 0, None, None)
+    rows = store.list_snapshots("pub-1")
+    assert rows[0]["views"] is None
+    assert rows[0]["watch_time_seconds"] is None
+    assert rows[0]["likes"] == 0
+    assert rows[0]["comments"] is None
+    assert rows[0]["shares"] is None
+
+
+def test_legacy_snapshots_upgrade_to_nullable_counts(tmp_path):
+    """US-038: a legacy snapshots table with NOT NULL counts upgrades to
+    nullable ones. Recorded zeros keep their meaning (a stored 0 was sent
+    as 0 at the time); an absent count afterwards stores as absent.
+    Re-opening the migrated file is a no-op."""
+    path = tmp_path / "legacy-snapshots.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            publication_id TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            views INTEGER NOT NULL,
+            watch_time_seconds INTEGER NOT NULL,
+            likes INTEGER NOT NULL,
+            comments INTEGER NOT NULL,
+            shares INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO snapshots (
+            publication_id, captured_at, views, watch_time_seconds, likes, comments, shares
+        ) VALUES ('pub-1', '2026-11-01T00:00:00Z', 10, 0, 0, 0, 0)
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = _store(path)
+    rows = store.list_snapshots("pub-1")
+    assert rows[0]["views"] == 10
+    assert rows[0]["likes"] == 0
+    store.add_snapshot("pub-1", "2026-11-02T00:00:00Z", None, None, None, None, None)
+    rows = store.list_snapshots("pub-1")
+    assert len(rows) == 2
+    assert rows[1]["views"] is None
+    assert rows[1]["watch_time_seconds"] is None
+
+    reopened = _store(path)
+    after = reopened.list_snapshots("pub-1")
+    assert len(after) == 2
+    assert after[0]["views"] == 10
+    assert after[1]["views"] is None
+
+
 def test_legacy_niche_rows_become_a_theme_and_a_series(tmp_path):
     path = tmp_path / "legacy.sqlite"
     conn = sqlite3.connect(path)
@@ -575,6 +636,50 @@ def test_legacy_click_counters_are_backfilled_into_the_log(tmp_path):
     assert reopened.get_experiment("exp-clicks").clicks == 5
 
 
+def test_the_duplicate_code_migration_records_every_rename(tmp_path):
+    """US-039: each rename is recorded with the row id and both codes, once.
+    Re-opening the migrated file neither rewrites the log nor appends."""
+    path = tmp_path / "legacy-rename-log.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE niches (id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO niches (id, name, language) VALUES ('history', 'History', 'en')")
+    conn.execute(_LEGACY_EXPERIMENTS_SCHEMA)
+    conn.executemany(
+        """
+        INSERT INTO experiments (
+            id, niche_id, hypothesis, hook_id, script, caption, style_json, money_json,
+            status, length_sec, measurement_window_days, language
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            _legacy_row("exp-first", "abc"),
+            _legacy_row("exp-second", "abc"),
+            _legacy_row("exp-third", "abc"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    store = _store(path)
+    recorded = store.get_setting("tracking_code_renames")
+    assert recorded == [
+        {"experiment_id": "exp-second", "old_code": "abc", "new_code": "abc-2"},
+        {"experiment_id": "exp-third", "old_code": "abc", "new_code": "abc-3"},
+    ]
+
+    # A lab with no duplicates records nothing.
+    clean = _store(str(path.parent / "clean.sqlite"))
+    clean.insert_experiment(
+        _faceless(id="exp-clean", money=Affiliate(tracking_code="clean", merchant="acme"))
+    )
+    assert clean.get_setting("tracking_code_renames") is None
+
+    reopened = _store(path)
+    assert reopened.get_setting("tracking_code_renames") == recorded
+
+
 def test_lineage_round_trips_through_insert_and_save(tmp_path):
     """US-031: parent_ids and factor_diffs persist on the experiment, and a
     save never erases them."""
@@ -648,6 +753,41 @@ def test_legacy_rows_upgrade_with_empty_lineage(tmp_path):
     reopened = _store(path)
     assert reopened.get_experiment("exp-old").parent_ids == ()
     assert reopened.get_experiment("exp-child") == approved
+
+
+def test_legacy_rows_upgrade_without_the_first_post_stamp(tmp_path):
+    """US-035: a legacy database without first_posted_at upgrades cleanly.
+    Old rows read back with no stamp (their window falls back to
+    approved_at), a stamp written afterwards round-trips, and re-opening
+    the migrated file is a no-op."""
+    path = tmp_path / "legacy-first-post.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE niches (id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO niches (id, name, language) VALUES ('history', 'History', 'en')")
+    conn.execute(_LEGACY_EXPERIMENTS_SCHEMA)
+    conn.execute(
+        """
+        INSERT INTO experiments (
+            id, niche_id, hypothesis, hook_id, script, caption, style_json, money_json,
+            status, length_sec, measurement_window_days, language
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        _legacy_row("exp-old", "abc"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = _store(path)
+    loaded = store.get_experiment("exp-old")
+    assert loaded.first_posted_at is None
+    stamped = replace(loaded, first_posted_at="2026-11-19T00:00:00Z")
+    store.save_experiment(stamped)
+    assert store.get_experiment("exp-old") == stamped
+
+    reopened = _store(path)
+    assert reopened.get_experiment("exp-old") == stamped
 
 
 def test_a_failed_ledger_insert_rolls_the_total_back(tmp_path):

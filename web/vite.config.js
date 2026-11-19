@@ -18,6 +18,7 @@ export default defineConfig({
       "/themes": { target: api },
       "/niches": { target: api },
       "/offers": { target: api },
+      "/tracking-code-renames": { target: api },
       "/r": { target: api },
     },
   },

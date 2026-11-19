@@ -50,8 +50,10 @@ def test_flow_from_starter_grid_to_a_draft_proposal(tmp_path):
     assert rendered.status_code == 200, rendered.text
     assert rendered.json()["status"] == "in_review"
 
-    # Approve eight days ago: the 7-day measurement window is always already
-    # closed, so the unforced complete below can never become a 409.
+    # Approve eight days ago: approved_at is what the browser sent, and the
+    # window anchor is the later of that and the first post (US-035). The
+    # post below stamps the anchor as this test runs, so the unforced
+    # complete answers 409 and the override closes it.
     approved_at = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
     approved = client.post(
         f"/experiments/{experiment_id}/approve",
@@ -86,9 +88,14 @@ def test_flow_from_starter_grid_to_a_draft_proposal(tmp_path):
     assert click.headers["location"] == "https://example.test/acme"
 
     closed = client.post(f"/experiments/{experiment_id}/complete")
-    assert closed.status_code == 200, closed.text
-    assert closed.json()["status"] == "complete"
-    assert closed.json()["clicks"] == 1
+    # US-035: the window anchored at the first post moments ago, not at the
+    # eight-day-old approval, so the guard refuses and the override closes.
+    assert closed.status_code == 409
+    assert "measurement window ends" in closed.json()["detail"]
+    forced = client.post(f"/experiments/{experiment_id}/complete", json={"force": True})
+    assert forced.status_code == 200
+    assert forced.json()["status"] == "complete"
+    assert forced.json()["clicks"] == 1
 
     before = {row["id"] for row in client.get("/experiments").json()}
     # US-027: the one finished row sits in a cell below the sample floor, so

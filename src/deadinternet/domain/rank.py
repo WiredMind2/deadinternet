@@ -55,16 +55,40 @@ def suggest(completed: list[Experiment], catalog: Catalog) -> list[DraftSpec]:
     eligible = eligible_parents(completed)
     if not eligible:
         return []
-    parent = max(eligible, key=lambda row: (row.revenue_cents, row.clicks, row.id))
+    drafts = [
+        _draft_from_parent(parent, completed, catalog)
+        for parent in _best_of_each_money_kind(eligible)
+    ]
+    return parse_proposal([_to_raw(draft) for draft in drafts], catalog)
+
+
+def _best_of_each_money_kind(eligible: list[Experiment]) -> list[Experiment]:
+    """Decision 3 (US-036): money paths are scored apart, so the parent
+    pick ranks within one money kind only — a rich platform payout never
+    dethrones an affiliate winner and is never ranked against one. Each
+    kind that reached the sample floor names its own best row, and kinds
+    surface in the order their first eligible row does."""
+    groups: dict[str, list[Experiment]] = {}
+    for row in eligible:
+        groups.setdefault(_money_key(row), []).append(row)
+    return [
+        max(rows, key=lambda row: (row.revenue_cents, row.clicks, row.id))
+        for rows in groups.values()
+    ]
+
+
+def _draft_from_parent(
+    parent: Experiment, rows: list[Experiment], catalog: Catalog
+) -> DraftSpec:
     next_style = _other_style(parent, catalog)
     diffs = (FactorDiff("style", style_key(parent.style)[0], style_key(next_style)[0]),)
     beats = (Beat(spoken=f"Follow-up script distinct from {parent.id}.", on_screen="", visual_note=""),)
-    draft = DraftSpec(
+    return DraftSpec(
         parent_ids=(parent.id,),
         factor_diffs=diffs,
         niche_id=parent.niche_id,
         style=next_style,
-        money=_child_money(parent, completed),
+        money=_child_money(parent, rows),
         hook_id=parent.hook_id,
         hypothesis=f"Change style after {parent.id}",
         script=script_from_beats(beats),
@@ -72,7 +96,6 @@ def suggest(completed: list[Experiment], catalog: Catalog) -> list[DraftSpec]:
         length_sec=parent.length_sec,
         beats=beats,
     )
-    return parse_proposal([_to_raw(draft)], catalog)
 
 
 def _money_key(row: Experiment) -> str:

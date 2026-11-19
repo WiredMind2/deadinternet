@@ -39,12 +39,12 @@ index and `archive/` before minting a new one.
 | US-032 | Faceless stills render speaks each beat | 5 | Done |
 | US-033 | Burned-in captions from beat on-screen text | 3 | Done |
 | US-034 | Public read-only click app | 3 | Done |
-| US-035 | The window starts at the first post, on the server clock | 2 | Ready |
-| US-036 | Money paths are scored apart | 3 | Ready |
+| US-035 | The window starts at the first post, on the server clock | 2 | Done |
+| US-036 | Money paths are scored apart | 3 | Done |
 | US-037 | Correct a payout with a reversal | 2 | Done |
-| US-038 | Snapshots honest about gaps | 2 | Ready |
-| US-039 | Show which legacy codes the migration renamed | 1 | Ready |
-| US-040 | The Post tab never hides the live publication behind a stale one | 1 | Ready |
+| US-038 | Snapshots honest about gaps | 2 | Done |
+| US-039 | Show which legacy codes the migration renamed | 1 | Done |
+| US-040 | The Post tab never hides the live publication behind a stale one | 1 | Done |
 
 ## Retired ids
 
@@ -112,10 +112,33 @@ US-034 (the public read-only click app: `python -m deadinternet
 --public [port]` serves only `GET /r/{code}` on its own process against
 the same lab database, with every admin route 404 and no store detail
 leaking; the admin app keeps its /r route for local dev) also landed the
-same day. Remaining backlog: US-035 (window anchored to the first post,
-server clock), US-036 (money paths scored apart), US-038 (absent vs
-zero snapshots), US-039 (migration renames surfaced), US-040 (stale
-publication on Post). Explicitly deferred per the reflexion:
+same day. The remaining backlog closed on main 2026-11-19: US-040 (the
+Post tab picks the newest publication per platform, so a stale
+manual_needed row can no longer hide the posted one's snapshot form and
+history), US-035 (the measurement window anchors at the first posted
+publication on the server clock — `first_posted_at`, legacy-safe column;
+the guard and `_clicks_window` share one anchor, the later of the first
+post and approval, so an experiment never posted falls back to the
+approval stamp; Board and Post show the window end before the 409), US-036
+(decision 3 enforced: suggest picks one parent per money kind and never
+ranks kinds against each other, Results totals revenue per path and marks
+platform_payout rows as settling after the window, and the dead
+`payout_cents` copy is gone from the served payloads), US-038 (blank
+snapshot counts are stored absent — nullable columns with a legacy
+rebuild — and SnapshotHistory and percent viewed read "—" for them, while
+recorded zeros keep their meaning), and US-039 (the duplicate-code
+upgrade records every rename under the `tracking_code_renames` settings
+key, a dismissable dashboard banner names the affected experiments, and
+the Copy link button always reads the served current code). The whole
+operator loop for these five was re-verified in the browser on a temp
+lab, including the stale-publication pick, the window-end display on
+Board and Post, the "—" snapshot cells beside legacy measured zeros, the
+per-path revenue totals, the settles-after-the-window marks on Results
+and Proposals, and the rename banner's dismiss-and-return lifecycle.
+Known pre-existing (not from this landing): four end-of-session
+ResourceWarnings from the two test_store tests that construct Store
+directly instead of the registered `_store` helper. Explicitly deferred
+per the reflexion:
 auto-posting clients, the avatar provider, a smarter LLM proposer,
 bandit statistics, stock-footage clips, splitting App.jsx, an ORM, a
 scheduler. The cell not controlling for hook and length (review finding

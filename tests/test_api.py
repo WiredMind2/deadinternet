@@ -1,3 +1,4 @@
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from deadinternet.api import create_app
-from deadinternet.api.app import _clicks_window, _render_cap
+from deadinternet.api.app import _clicks_window, _parse_iso, _render_cap
 from deadinternet.domain.experiment import (
     Affiliate,
     FactorDiff,
@@ -21,6 +22,7 @@ from deadinternet.domain.experiment import (
     mark_rendered,
 )
 from tests.helpers import experiment, experiment_body, open_store
+from tests.test_store import _LEGACY_EXPERIMENTS_SCHEMA, _legacy_row, _store as _registered_store
 
 NOW = "2026-10-31T12:00:00Z"
 
@@ -647,6 +649,145 @@ def test_complete_after_the_window_or_without_approved_at_needs_no_body(tmp_path
         assert clockless.json()["status"] == "complete"
 
 
+def test_the_first_post_stamps_the_window_anchor_on_the_server_clock(tmp_path):
+    """US-035: the window anchor is the first posted publication, stamped by
+    the server. A video approved a month ago but posted now is back inside
+    its window: the anchor ignores the stale approval because the post is
+    later, so the unforced complete refuses until the window really ends."""
+    store = open_store(tmp_path)
+    _series(store)
+    store.insert_experiment(
+        experiment(id="exp-post", status=Status.in_review, file_path="data/videos/exp-post.mp4")
+    )
+    with TestClient(create_app(store)) as client:
+        month_old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        approved = client.post("/experiments/exp-post/approve", json={"now": month_old})
+        assert approved.status_code == 200
+        assert approved.json()["approved_at"] == month_old
+        before = datetime.now(timezone.utc)
+        posted = client.post(
+            "/experiments/exp-post/publications",
+            json={"platform": "tiktok", "account_id": "acct-1", "token": "secret"},
+        )
+        after = datetime.now(timezone.utc)
+        assert posted.status_code == 200
+        assert posted.json()["status"] == "posted"
+        stored = store.get_experiment("exp-post")
+        stamped = _parse_iso(stored.first_posted_at)
+        assert stamped is not None
+        # The stamp is whole-second (like every clock this lab writes), so
+        # the bounds compare at that granularity.
+        assert before.replace(microsecond=0) <= stamped <= after
+        assert stored.approved_at == month_old
+
+        early = client.post("/experiments/exp-post/complete")
+        assert early.status_code == 409
+        assert "measurement window ends" in early.json()["detail"]
+        # The payload shows the same end Board and Post display: anchored
+        # at the fresh post, seven days out, not at the month-old approval.
+        row = next(item for item in client.get("/results").json() if item["id"] == "exp-post")
+        assert row["first_posted_at"] == stored.first_posted_at
+        end = _parse_iso(row["window_end"])
+        assert before.replace(microsecond=0) + timedelta(days=7) <= end <= after + timedelta(days=7)
+
+        forced = client.post("/experiments/exp-post/complete", json={"force": True})
+        assert forced.status_code == 200
+        assert forced.json()["status"] == "complete"
+
+
+def test_clicks_after_the_post_are_windowed_and_pre_post_clicks_are_not(tmp_path):
+    """US-035: `_clicks_window` opens at the same anchor as the complete
+    guard. A click between approval and the first post sits before the
+    anchor and stays outside the window; one after the post is inside."""
+    store = open_store(tmp_path)
+    _series(store)
+    approved_at = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    store.insert_experiment(
+        experiment(
+            id="exp-click",
+            status=Status.approved,
+            approved_at=approved_at,
+            clicks=2,
+            money=Affiliate(tracking_code="win-1", merchant="acme"),
+        )
+    )
+    backdated = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    for _ in range(2):
+        store._conn.execute(
+            "INSERT INTO clicks (tracking_code, experiment_id, created_at) VALUES (?, ?, ?)",
+            ("win-1", "exp-click", backdated),
+        )
+    store._conn.commit()
+    with TestClient(create_app(store)) as client:
+        posted = client.post(
+            "/experiments/exp-click/publications",
+            json={"platform": "tiktok", "account_id": "acct-1", "token": "secret"},
+        )
+        assert posted.status_code == 200
+        store.add_click("win-1")
+        rows = client.get("/results").json()
+    row = next(item for item in rows if item["id"] == "exp-click")
+    assert row["clicks"] == 3
+    assert row["clicks_window"] == 1
+
+
+def test_pasting_the_manual_url_stamps_the_first_post_too(tmp_path):
+    """US-035: the manual pack route is the other path to `posted`, so it
+    stamps the same anchor on the server clock."""
+    store = open_store(tmp_path)
+    _series(store)
+    store.insert_experiment(
+        experiment(id="exp-manual", status=Status.in_review, file_path="data/videos/exp-manual.mp4")
+    )
+    with TestClient(create_app(store)) as client:
+        assert client.post("/experiments/exp-manual/approve", json={"now": NOW}).status_code == 200
+        manual = client.post(
+            "/experiments/exp-manual/publications",
+            json={"platform": "instagram", "account_id": "acct-1", "token": None},
+        )
+        assert manual.status_code == 200
+        assert manual.json()["status"] == "manual_needed"
+        assert store.get_experiment("exp-manual").first_posted_at is None
+        before = datetime.now(timezone.utc)
+        pasted = client.post(
+            f"/publications/{manual.json()['id']}/url",
+            json={"url": "https://instagram.example/manual/1"},
+        )
+        after = datetime.now(timezone.utc)
+        assert pasted.status_code == 200
+        stamped = _parse_iso(store.get_experiment("exp-manual").first_posted_at)
+        assert stamped is not None
+        assert before.replace(microsecond=0) <= stamped <= after
+        early = client.post("/experiments/exp-manual/complete")
+        assert early.status_code == 409
+        assert "measurement window ends" in early.json()["detail"]
+
+
+def test_a_second_platforms_post_never_moves_the_first_post_stamp(tmp_path):
+    """US-035: the anchor is the FIRST post. A second platform's post must
+    not re-open the window from its own later stamp."""
+    store = open_store(tmp_path)
+    _series(store)
+    store.insert_experiment(
+        experiment(id="exp-two", status=Status.in_review, file_path="data/videos/exp-two.mp4")
+    )
+    with TestClient(create_app(store)) as client:
+        assert client.post("/experiments/exp-two/approve", json={"now": NOW}).status_code == 200
+        first = client.post(
+            "/experiments/exp-two/publications",
+            json={"platform": "tiktok", "account_id": "acct-1", "token": "secret"},
+        )
+        assert first.status_code == 200
+        stamped = store.get_experiment("exp-two").first_posted_at
+        assert stamped is not None
+        second = client.post(
+            "/experiments/exp-two/publications",
+            json={"platform": "youtube", "account_id": "acct-1", "token": "secret"},
+        )
+        assert second.status_code == 200
+        assert store.get_experiment("exp-two").first_posted_at == stamped
+
+
 def test_a_crashing_renderer_lands_in_render_failed_not_rendering(tmp_path):
     """US-018: a renderer that dies mid-flight must not strand the row in
     `rendering`, where no route can reach it again. The failure is recorded
@@ -774,6 +915,69 @@ def test_a_publication_needs_an_account_id(tmp_path):
     assert posted.status_code == 422
     assert posted.json()["detail"] == "account_id is required"
     assert store.list_publications("exp-post") == []
+
+
+def test_publication_payloads_no_longer_carry_the_dead_payout_cents(tmp_path):
+    """US-036: `payout_cents` was written by nothing and duplicated the
+    revenue ledger (the closing audit's flag), so it is dropped from every
+    payload that serves a publication."""
+    store = open_store(tmp_path)
+    store.insert_experiment(
+        experiment(id="exp-post", status=Status.in_review, file_path="data/videos/exp-post.mp4")
+    )
+    with TestClient(create_app(store)) as client:
+        assert client.post("/experiments/exp-post/approve", json={"now": NOW}).status_code == 200
+        posted = client.post(
+            "/experiments/exp-post/publications",
+            json={"platform": "tiktok", "account_id": "acct-1", "token": "secret"},
+        )
+        assert posted.status_code == 200
+        assert "payout_cents" not in posted.json()
+        listed = client.get("/experiments/exp-post/publications")
+        assert listed.status_code == 200
+        assert all("payout_cents" not in row for row in listed.json())
+
+
+def test_the_upgrade_surfaces_each_tracking_code_rename(tmp_path):
+    """US-039: the recorded renames are served to the dashboard, and the
+    experiments list carries the current (post-migration) code the Copy
+    link button reads its URL from."""
+    path = tmp_path / "legacy-renames-api.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE niches (id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO niches (id, name, language) VALUES ('history', 'History', 'en')")
+    conn.execute(_LEGACY_EXPERIMENTS_SCHEMA)
+    conn.executemany(
+        """
+        INSERT INTO experiments (
+            id, niche_id, hypothesis, hook_id, script, caption, style_json, money_json,
+            status, length_sec, measurement_window_days, language
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [_legacy_row("exp-first", "abc"), _legacy_row("exp-second", "abc")],
+    )
+    conn.commit()
+    conn.close()
+
+    store = _registered_store(path)
+    with TestClient(create_app(store)) as client:
+        served = client.get("/tracking-code-renames")
+        assert served.status_code == 200
+        assert served.json() == [
+            {"experiment_id": "exp-second", "old_code": "abc", "new_code": "abc-2"}
+        ]
+        rows = client.get("/experiments").json()
+    by_id = {row["id"]: row for row in rows}
+    # The Copy link button builds its URL from this served code.
+    assert by_id["exp-first"]["money"]["tracking_code"] == "abc"
+    assert by_id["exp-second"]["money"]["tracking_code"] == "abc-2"
+
+    # A lab with nothing recorded serves an empty list, not an error.
+    fresh = open_store(tmp_path)
+    with TestClient(create_app(fresh)) as client:
+        assert client.get("/tracking-code-renames").json() == []
 
 
 class _ClickTimesStore:

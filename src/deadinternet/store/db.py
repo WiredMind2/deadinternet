@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     length_sec INTEGER NOT NULL,
     proposal_id TEXT,
     approved_at TEXT,
+    first_posted_at TEXT,
     measurement_window_days INTEGER NOT NULL,
     file_path TEXT,
     render_error TEXT,
@@ -127,11 +128,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     publication_id TEXT NOT NULL,
     captured_at TEXT NOT NULL,
-    views INTEGER NOT NULL,
-    watch_time_seconds INTEGER NOT NULL,
-    likes INTEGER NOT NULL,
-    comments INTEGER NOT NULL,
-    shares INTEGER NOT NULL
+    views INTEGER,
+    watch_time_seconds INTEGER,
+    likes INTEGER,
+    comments INTEGER,
+    shares INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS revenue_ledger (
@@ -262,6 +263,7 @@ def _experiment_values(experiment: Experiment) -> tuple:
         experiment.length_sec,
         experiment.proposal_id,
         experiment.approved_at,
+        experiment.first_posted_at,
         experiment.measurement_window_days,
         experiment.file_path,
         experiment.render_error,
@@ -288,6 +290,7 @@ def _experiment_from_row(row: sqlite3.Row) -> Experiment:
         length_sec=row["length_sec"],
         proposal_id=row["proposal_id"],
         approved_at=row["approved_at"],
+        first_posted_at=row["first_posted_at"],
         measurement_window_days=row["measurement_window_days"],
         file_path=row["file_path"],
         render_error=row["render_error"],
@@ -337,9 +340,11 @@ class Store:
         self._conn.executescript(_SCHEMA)
         self._ensure_board_hash()
         self._ensure_lineage()
+        self._ensure_first_posted_at()
         self._ensure_unique_tracking_codes()
         self._ensure_click_log()
         self._ensure_reversal_link()
+        self._ensure_nullable_snapshot_counts()
 
     def _ensure_click_log(self) -> None:
         """US-025: the counter and the log must agree. Clicks recorded before
@@ -432,6 +437,60 @@ class Store:
             self._conn.execute("ALTER TABLE revenue_ledger ADD COLUMN reverses_entry_id INTEGER")
             self._conn.commit()
 
+    def _ensure_first_posted_at(self) -> None:
+        """US-035: the measurement window anchors to the first post, and
+        the stamp is the server's. Rows saved before the stamp existed
+        read back with none, so their window falls back to approved_at.
+        Idempotent."""
+        columns = self._column_names("experiments")
+        if not columns:
+            return
+        if "first_posted_at" not in columns:
+            self._conn.execute("ALTER TABLE experiments ADD COLUMN first_posted_at TEXT")
+            self._conn.commit()
+
+    def _ensure_nullable_snapshot_counts(self) -> None:
+        """US-038: a blank count is absent (NULL), never a measured zero.
+        SQLite cannot drop NOT NULL with ALTER, so a legacy snapshots table
+        is rebuilt once with nullable counts. Recorded zeros keep their
+        meaning — a stored 0 was what the operator sent at the time.
+        Idempotent."""
+        columns = self._column_names("snapshots")
+        if not columns:
+            return
+        counts = ("views", "watch_time_seconds", "likes", "comments", "shares")
+        info = self._conn.execute("PRAGMA table_info(snapshots)").fetchall()
+        if all(not row["notnull"] for row in info if row["name"] in counts):
+            return
+        with self._conn:
+            self._conn.execute(
+                """
+                CREATE TABLE snapshots_upgrade (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    publication_id TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    views INTEGER,
+                    watch_time_seconds INTEGER,
+                    likes INTEGER,
+                    comments INTEGER,
+                    shares INTEGER
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO snapshots_upgrade (
+                    id, publication_id, captured_at, views, watch_time_seconds,
+                    likes, comments, shares
+                )
+                SELECT id, publication_id, captured_at, views, watch_time_seconds,
+                       likes, comments, shares
+                FROM snapshots
+                """
+            )
+            self._conn.execute("DROP TABLE snapshots")
+            self._conn.execute("ALTER TABLE snapshots_upgrade RENAME TO snapshots")
+
     def _ensure_unique_tracking_codes(self) -> None:
         """One video, one code (US-024).
 
@@ -439,11 +498,13 @@ class Store:
         deleted: the earliest row keeps the code and every later duplicate
         is renamed with a `-2`/`-3` suffix, then a unique index refuses any
         new duplicate at the store level. An empty code means "no tracking"
-        and never takes part.
+        and never takes part. Each rename is recorded under the
+        `tracking_code_renames` settings key (US-039) so the upgrade never
+        silently re-credits a published /r/{old} link.
         """
         rows = self._conn.execute(
             """
-            SELECT rowid AS rid, json_extract(money_json, '$.tracking_code') AS code
+            SELECT rowid AS rid, id, json_extract(money_json, '$.tracking_code') AS code
             FROM experiments
             WHERE json_extract(money_json, '$.tracking_code') IS NOT NULL
               AND json_extract(money_json, '$.tracking_code') != ''
@@ -452,17 +513,17 @@ class Store:
         ).fetchall()
         taken = {row["code"] for row in rows}
         kept: set[str] = set()
-        renames: list[tuple[str, int]] = []
+        renames: list[tuple[int, str, str, str]] = []
         for row in rows:
             code = row["code"]
             if code in kept:
                 fresh = mint_tracking_code(code, taken)
                 taken.add(fresh)
-                renames.append((fresh, row["rid"]))
+                renames.append((row["rid"], row["id"], code, fresh))
                 continue
             kept.add(code)
         with self._conn:
-            for fresh, rid in renames:
+            for rid, _experiment_id, _old, fresh in renames:
                 self._conn.execute(
                     """
                     UPDATE experiments
@@ -470,6 +531,21 @@ class Store:
                     WHERE rowid = ?
                     """,
                     (fresh, rid),
+                )
+            if renames:
+                # Same transaction as the renames themselves: the log lands
+                # with the codes it describes, or neither does.
+                recorded = self.get_setting("tracking_code_renames") or []
+                recorded.extend(
+                    {"experiment_id": experiment_id, "old_code": old, "new_code": fresh}
+                    for _rid, experiment_id, old, fresh in renames
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO settings (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    ("tracking_code_renames", json.dumps(recorded)),
                 )
             self._conn.execute(
                 """
@@ -621,10 +697,10 @@ class Store:
             INSERT INTO experiments (
                 id, niche_id, hypothesis, hook_id, script, caption,
                 style_json, money_json, status, length_sec,
-                proposal_id, approved_at, measurement_window_days,
+                proposal_id, approved_at, first_posted_at, measurement_window_days,
                 file_path, render_error, language, clicks, revenue_cents, board_hash,
                 parent_ids_json, factor_diffs_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _experiment_values(experiment),
         )
@@ -657,6 +733,7 @@ class Store:
                 length_sec = ?,
                 proposal_id = ?,
                 approved_at = ?,
+                first_posted_at = ?,
                 measurement_window_days = ?,
                 file_path = ?,
                 render_error = ?,
@@ -678,6 +755,7 @@ class Store:
                 experiment.length_sec,
                 experiment.proposal_id,
                 experiment.approved_at,
+                experiment.first_posted_at,
                 experiment.measurement_window_days,
                 experiment.file_path,
                 experiment.render_error,
@@ -788,12 +866,14 @@ class Store:
         self,
         publication_id: str,
         captured_at: str,
-        views: int,
-        watch_time_seconds: int,
-        likes: int,
-        comments: int,
-        shares: int,
+        views: int | None,
+        watch_time_seconds: int | None,
+        likes: int | None,
+        comments: int | None,
+        shares: int | None,
     ) -> None:
+        """Insert one snapshot. A count of None is "not measured" and is
+        stored absent (US-038); a real 0 stays a measured 0."""
         self._write(
             """
             INSERT INTO snapshots (

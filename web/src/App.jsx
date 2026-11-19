@@ -30,6 +30,17 @@ function moneyKind(row) {
   return money.kind || "";
 }
 
+function revenueByPath(rows) {
+  // Decision 3 (US-036): revenue is totaled per money path, never as one
+  // sum across paths a 7-day window cannot compare.
+  const totals = {};
+  for (const row of rows) {
+    const kind = moneyKind(row) || "unknown";
+    totals[kind] = (totals[kind] || 0) + (Number(row.revenue_cents) || 0);
+  }
+  return totals;
+}
+
 function viewsOf(row) {
   if (!row || typeof row !== "object") return undefined;
   if (row.views !== undefined && row.views !== null) return row.views;
@@ -41,7 +52,10 @@ function changedFactors(row) {
   return [...new Set(row.factor_diffs.map((diff) => diff?.field).filter(Boolean))];
 }
 
-function percentViewed(watchTimeSeconds, lengthSec) {
+function percentViewed(views, watchTimeSeconds, lengthSec) {
+  // Absent views or watch time are "not measured" (US-038): the share
+  // reads "—" rather than a false 0%.
+  if (blank(views) || blank(watchTimeSeconds)) return "—";
   const watched = Number(watchTimeSeconds);
   const length = Number(lengthSec);
   if (!Number.isFinite(watched) || !Number.isFinite(length) || length <= 0) return "—";
@@ -314,6 +328,8 @@ function experimentFacts(experiment, { includeCopy = true } = {}) {
     { label: "clicks", value: show(experiment.clicks) },
     { label: "file_path", value: show(experiment.file_path), wide: true },
     { label: "approved_at", value: show(experiment.approved_at) },
+    { label: "first_posted_at", value: show(experiment.first_posted_at) },
+    { label: "window ends", value: show(experiment.window_end) },
   ];
   if (style.look) rows.push({ label: "look", value: show(style.look) });
   if (style.voice_id) rows.push({ label: "voice_id", value: show(style.voice_id) });
@@ -359,6 +375,22 @@ function Banner({ tone = "error", children }) {
   return (
     <p className={tone === "ok" ? "banner ok" : "banner"} role={tone === "ok" ? "status" : "alert"}>
       {children}
+    </p>
+  );
+}
+
+function CodeRenames({ renames, onDismiss }) {
+  if (!Array.isArray(renames) || renames.length === 0) return null;
+  const summary = renames
+    .map((row) => `${show(row.experiment_id)} (${show(row.old_code)} → ${show(row.new_code)})`)
+    .join(", ");
+  return (
+    <p className="banner" role="alert">
+      The duplicate-code upgrade renamed tracking codes: {summary}. A link published with
+      an old code now credits the experiment that kept it.{" "}
+      <button type="button" className="banner-dismiss" onClick={onDismiss}>
+        Dismiss
+      </button>
     </p>
   );
 }
@@ -1109,7 +1141,7 @@ function SnapshotHistory({ publicationId, lengthSec, version }) {
               <td>{show(row.captured_at)}</td>
               <td>{show(row.views)}</td>
               <td>{show(row.watch_time_seconds)}</td>
-              <td>{percentViewed(row.watch_time_seconds, lengthSec)}</td>
+              <td>{percentViewed(row.views, row.watch_time_seconds, lengthSec)}</td>
               <td>{show(row.likes)}</td>
               <td>{show(row.comments)}</td>
               <td>{show(row.shares)}</td>
@@ -1156,7 +1188,10 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
               ...next[platform],
               account_id: next[platform].account_id || publication.account_id || "",
               url: next[platform].url || publication.post_url || "",
-              publication: next[platform].publication || publication,
+              // The list arrives oldest-first, so the newest row wins the
+              // pick (US-040): a stale manual_needed attempt can no longer
+              // hide the posted one's snapshot form and history.
+              publication,
             };
           }
           return { ...current, [selected.id]: next };
@@ -1271,18 +1306,11 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
       setError("Post this video before recording views.");
       return;
     }
-    const raw = String(row.views ?? "").trim();
-    if (!raw) {
-      setError("Enter the number of views to record.");
-      return;
-    }
-    const views = Number(raw);
-    if (!Number.isInteger(views) || views < 0) {
-      setError("Views must be a whole number, zero or more.");
-      return;
-    }
+    // A field left blank is "not measured" and is sent as null (US-038);
+    // an explicit 0 stays a measured zero.
     const counts = {};
     for (const [field, label] of [
+      ["views", "Views"],
       ["watch_time_seconds", "Watch time"],
       ["likes", "Likes"],
       ["comments", "Comments"],
@@ -1290,7 +1318,7 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
     ]) {
       const value = String(row[field] ?? "").trim();
       if (!value) {
-        counts[field] = 0;
+        counts[field] = null;
         continue;
       }
       const parsed = Number(value);
@@ -1306,10 +1334,14 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
     try {
       await api("/snapshots", {
         method: "POST",
-        body: JSON.stringify({ publication_id: publicationId, views, ...counts }),
+        body: JSON.stringify({ publication_id: publicationId, ...counts }),
       });
       setSnapshotVersion((current) => current + 1);
-      await onChanged(`Recorded a snapshot for ${platform}: ${views} views.`);
+      await onChanged(
+        counts.views === null
+          ? `Recorded a snapshot for ${platform}.`
+          : `Recorded a snapshot for ${platform}: ${counts.views} views.`,
+      );
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -1368,6 +1400,9 @@ function Post({ experiments, selectedId, onSelect, onChanged, loadError }) {
               <span className="mono">{selected.id}</span>
               <span className={`status status-${selected.status}`}>{selected.status}</span>
             </p>
+            {selected.window_end ? (
+              <p className="meta">measurement window ends {selected.window_end}</p>
+            ) : null}
             <p className="meta">Leave the token blank. This lab returns a manual pack instead of posting.</p>
             <ol className="platforms">
               {PLATFORMS.map((platform) => {
@@ -1568,14 +1603,13 @@ function Results() {
     <>
       <Banner>{error}</Banner>
       {loaded && rows.length === 0 && !error ? <p>No results yet.</p> : null}
-      {rows.length > 0 ? (
-        <p className="meta">
-          Total revenue_cents across experiments{" "}
-          <span className="mono">
-            {rows.reduce((sum, row) => sum + (Number(row.revenue_cents) || 0), 0)}
-          </span>
-        </p>
-      ) : null}
+      {rows.length > 0
+        ? Object.entries(revenueByPath(rows)).map(([kind, total]) => (
+            <p key={kind} className="meta">
+              revenue_cents on {kind} <span className="mono">{total}</span>
+            </p>
+          ))
+        : null}
       <div className="score">
         {rows.map((row, index) => {
           const views = viewsOf(row);
@@ -1616,6 +1650,9 @@ function Results() {
               ) : null}
               {below ? (
                 <p className="floor">Completed videos in this cell are below the sample floor.</p>
+              ) : null}
+              {moneyKind(row) === "platform_payout" ? (
+                <p className="floor">Platform payouts settle after the measurement window.</p>
               ) : null}
             </article>
           );
@@ -1710,6 +1747,9 @@ function Proposals({ drafts, setDrafts, onAccepted }) {
                   )}
                 </tbody>
               </table>
+              {moneyKind(draft) === "platform_payout" ? (
+                <p className="floor">Platform payouts settle after the measurement window.</p>
+              ) : null}
               <Facts
                 rows={[
                   { label: "hook_id", value: show(draft.hook_id) },
@@ -2252,7 +2292,31 @@ export default function App() {
   const [selectedId, setSelectedId] = useState("");
   const [notice, setNotice] = useState("");
   const [drafts, setDrafts] = useState([]);
+  const [codeRenames, setCodeRenames] = useState(null);
+  const [renamesDismissed, setRenamesDismissed] = useState(() => {
+    try {
+      return window.localStorage.getItem("dismissed-code-renames") || "";
+    } catch {
+      return "";
+    }
+  });
   const loadSeqRef = useRef(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    api("/tracking-code-renames")
+      .then((data) => {
+        if (!cancelled) setCodeRenames(unwrapList(data));
+      })
+      .catch(() => {
+        // A lab that predates the route, or one with nothing recorded,
+        // shows no banner: the renames are an upgrade notice, not a fault.
+        if (!cancelled) setCodeRenames([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function loadExperiments() {
     const seq = ++loadSeqRef.current;
@@ -2304,6 +2368,23 @@ export default function App() {
         </ul>
       </nav>
       <main id="main">
+        {codeRenames !== null &&
+        codeRenames.length > 0 &&
+        renamesDismissed !== JSON.stringify(codeRenames) ? (
+          <CodeRenames
+            renames={codeRenames}
+            onDismiss={() => {
+              const stamped = JSON.stringify(codeRenames);
+              setRenamesDismissed(stamped);
+              try {
+                window.localStorage.setItem("dismissed-code-renames", stamped);
+              } catch {
+                // localStorage can be unavailable (private mode); the
+                // dismissal then lasts this session only.
+              }
+            }}
+          />
+        ) : null}
         <h1>{screen}</h1>
         <Banner tone="ok">{notice}</Banner>
         {screen === "Board" ? (
