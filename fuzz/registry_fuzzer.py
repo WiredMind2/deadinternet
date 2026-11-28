@@ -7,13 +7,13 @@ import atheris
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / 'src'))
 
-from deadinternet.render.registry import render  # noqa: E402
+from deadinternet.publish.registry import publish  # noqa: E402
 
 
 def TestOneInput(data: bytes) -> None:
     fdp = atheris.FuzzedDataProvider(data)
     try:
-        render(fdp.ConsumeUnicodeNoSurrogates(min(fdp.RemainingBytes(), 4096)), fdp.ConsumeUnicodeNoSurrogates(min(fdp.RemainingBytes(), 4096)))
+        publish(fdp.ConsumeUnicodeNoSurrogates(min(fdp.RemainingBytes(), 4096)), fdp.ConsumeUnicodeNoSurrogates(min(fdp.RemainingBytes(), 4096)), fdp.ConsumeUnicodeNoSurrogates(min(fdp.RemainingBytes(), 4096)))
     except Exception:
         pass
 
